@@ -1,0 +1,13 @@
+.DS_Store
+__MACOSX/
+# build output
+qfind
+origr
+r_d
+r_p
+r_v
+r_fs
+*.o
+*.dSYM/
+# copy of the ConwayLife forum thread (other people's posts)
+context/
