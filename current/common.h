@@ -706,7 +706,7 @@ int lookaheadMethod = 0;     /* --lookahead-method: 0 = auto, 1 = cone, 2 = spli
 int useSplitLookahead = 0;   /* chosen for this search: 0 = cone, 1 = split, 2 = hybrid (1, 2 need the half-tables) */
 long lookaheadBudget = LOOKAHEAD_BUDGET;   /* --lookahead-budget: work units before the hybrid switches to split */
 #ifndef SPLIT_CACHE_BITS
-#define SPLIT_CACHE_BITS 20
+#define SPLIT_CACHE_BITS 22
 #endif
 int splitCacheBits = SPLIT_CACHE_BITS;     /* --split-cache-bits: 2^N shared split-cache entries per half */
 static int lowHalfBits, lowResultBits, highHalfShift, highHalfBits, highResultBits;

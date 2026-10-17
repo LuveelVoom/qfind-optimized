@@ -23,7 +23,7 @@ This document explains every change made to `qfind.c` and `common.h` relative to
 | Table memory | about 40% less by default, about 57% less with `-DPACKLISTS` [measured] | identical table contents [verified] |
 | Table memory growth (width ≥ 10) | **factored tables**: growth per extra width drops from about 7× to about 2.8×. Width 10: 1.48 GB → 6 MB; widths 11–12 now run in 16–26 MB where the old layout ran out of memory (section 4.4) [measured] | exhaustive; identical search when lists are sorted (`-DFACTORED_SORTED`) [verified] |
 | Lookahead cost growth (width ≥ 12) | **split lookahead**: each lookahead test is solved on half rows joined on their 2 overlap bits, so its cost no longer grows with width. Equal-work time vs the previous lookahead: 2.5× slower at widths 7–8, about even at 12, 2.4× faster at 13 (first deepening). Used automatically from width 12 (section 3.7) [measured] | same answer on every test, so the same search [verified] |
-| Split lookahead cache (width ≥ 12) | **shared by all threads**, 2^20 entries per half by default (288 MB total): 1.1–1.25× faster at widths 12–14 with the default size, up to 1.47× with `--split-cache-bits 22` (section 3.10) [measured, M4 Pro] | same answers [verified] |
+| Split lookahead cache (width ≥ 12) | **shared by all threads**, 2^22 entries per half by default (1152 MB total), with prefetching: about 1.35× faster than the shared 2^20 cache and about 1.6× faster than the original per-thread cache at width 12 (sections 3.10, 3.12) [measured, M4 Pro] | same answers [verified] |
 | Bugs | 22 fixed; 19 also exist in the original (section 6) | no change on valid input [verified] |
 | Readability | cryptic names renamed, an explanatory overview and comments added, dead code removed (section 7) | no change [verified] |
 | New features | progress readouts with time and memory; `--lookahead-depth`; `--tables`; `--lookahead-method` / `--lookahead-budget`; `--help` performance notes | — |
@@ -58,7 +58,7 @@ gcc -std=c11 -fopenmp -march=native -O3 -Wall -Wextra -o qfind qfind.c
 | `--lookahead-depth 1\|2\|3` | **New.** 3 is the full test (the default). 1 or 2 prune less per candidate but cost less (section 5). |
 | `--lookahead-method auto\|cone\|split\|hybrid` | **New.** How the full lookahead test is computed. auto (the default) uses split from width 12 and cone below (section 3.7). All methods give identical answers. |
 | `--lookahead-budget N` | **New.** For `hybrid`: work units before a test switches from cone to split (default 256). |
-| `--split-cache-bits N` | **New.** Split and hybrid: 2^N shared cache entries per half (default 20 = 288 MB; 8–30). Larger is faster from width 11 up (section 3.10). |
+| `--split-cache-bits N` | **New.** Split and hybrid: 2^N shared cache entries per half (default 22 = 1152 MB; 8–30). Larger is faster from width 11 up (section 3.10). |
 | `--tables auto\|pair\|factored` | **New.** The lookup table representation. auto (the default) uses per-pair tables below width 10 and factored tables from width 10 (section 4.4). |
 | `-w` | Now rejects widths above 14, which used to crash. |
 | `-t` | Now rejects values ≤ 0. The default is at least 1 (the old default was 0 on a 1-CPU machine). |
@@ -83,7 +83,7 @@ These are qfind's own options (compile-time `-D` macros and runtime flags), incl
 | (default build) | — | 3.50 s / 2.52 s | 30 / 32 MB | |
 | `-DPACKLISTS` | new | 3.76 s / 2.70 s (+7%) | 22 / 22 MB | Packs table entries into `width` bits. About 24–31% less table memory; the slowdown is about 7% here and up to about 25% on other searches [measured]. Use only when tables don't fit in RAM. |
 | `-DLA_VERIFY` | new | 5.59 s / 3.56 s (+41–60%) | same | Runs both lookaheads and compares them. Auditing only. |
-| `--lookahead-method split` (runtime option; auto from width 12) | new | — | 288 MB shared by all threads (`--split-cache-bits`, 3.10) | See 3.7: 2.5× slower at widths 7–8, about even at 12, 2.4× faster at 13 at equal work. |
+| `--lookahead-method split` (runtime option; auto from width 12) | new | — | 1152 MB shared by all threads (`--split-cache-bits`, 3.10) | See 3.7: 2.5× slower at widths 7–8, about even at 12, 2.4× faster at 13 at equal work. |
 | `-DPERIOD=p -DOFFSET=o` (fixed speed) | yes | c/5: 3.25 s vs runtime-speed build 3.17 s; c/4: 2.27 s vs 2.39 s | same | No longer measurably faster than giving `-v` at run time. The original's comment says it may be "slightly faster"; here the difference was within noise. |
 | `-DFACTORED_SORTED` | new | slower than unsorted factored (sorting each list) | same as factored | Testing only (exactness check). |
 | `-DFORCECACHE` (with a fixed speed) | yes | c/4: 2.79 s vs 2.27 s without (+23%) | +1 MB | Compiles the lookahead cache in. Now never recommended. |
@@ -237,7 +237,7 @@ It is never clearly the best choice, so it is not used automatically. It is kept
 - `--lookahead-depth 1` and `2` always use the previous lookahead; split applies only to the full test.
 - The lookahead cache (`-c`) path is unchanged.
 - Correctness: `-DLA_VERIFY` compares every test against the original lookahead. It passed with split and with hybrid (budgets 0, 8, 16, 64, 256), and the regression searches give output identical to the original (section 8) [verified].
-- The split cache (288 MB by default, see 3.10) is not included in the "tables+index" readout; the start-up summary prints its size.
+- The split cache (1152 MB by default, see 3.10) is not included in the "tables+index" readout; the start-up summary prints its size.
 
 ### 3.8 Inner split (`-DINNER_SPLIT`, experimental)
 
@@ -266,7 +266,7 @@ Only the deepening step used threads; the breadth-first step (`process()`) ran s
 
 ### 3.10 Shared split-lookahead cache (`--split-cache-bits`)
 
-**What changed.** The split lookahead (3.7) caches half-cone sets keyed by (half-row context, row11 half). That cache was per thread, with 2^16 entries per half (about 18 MB per thread). It is now one cache shared by all threads, 2^20 entries per half by default (288 MB in total, whatever the thread count), set with `--split-cache-bits N`.
+**What changed.** The split lookahead (3.7) caches half-cone sets keyed by (half-row context, row11 half). That cache was per thread, with 2^16 entries per half (about 18 MB per thread). It is now one cache shared by all threads, set with `--split-cache-bits N`. The default was first 2^20 entries per half (288 MB) and is now 2^22 (1152 MB in total, whatever the thread count; see the second table below).
 
 **Why.** At widths 12–13 about 65–85% of the time was in the split lookahead, mostly in computing half-cone sets on cache misses [measured, `sample` profiles]. A larger cache misses less, and a shared one lets every thread reuse sets computed by the others. Making the private caches larger instead would multiply memory by the thread count (2^22 entries cost 11 GB at 10 threads).
 
@@ -284,6 +284,8 @@ Only the deepening step used threads; the breadth-first step (`process()`) ran s
 | w13, 1 thread, 1st deepening | 14.3 s | 13.0 s (1.10×) | 12.4 s with 2^22 (1.15×) |
 | w13, 10 threads, 4th deepening | 43.6 s | 37.0 s (1.18×) | 36.4 s with 2^23 |
 | w14, 10 threads, 2nd deepening | over 60 s | 59.7 s | 45.4 s with 2^23 |
+
+**Default raised to 2^22** (single thread, c/5 w12 even, time to the 4th deepening, two rounds): 2^20 66.3 / 68.5 s, 2^22 57.9 / 58.6 s (about 1.15×), 2^23 57.1 / 60.4 s, 2^24 62.1 / 59.7 s. Beyond 2^22 there was no further gain, so the default is 2^22 (1152 MB) [measured]. Note: these and the 3.12 timings ran while another 12-thread search was using most of the machine, so they are single-thread comparisons only.
 
 At widths 10–11 the cone lookahead is still as fast or faster than split with the larger cache (c/4 w11 odd: 16 vs 14 deepenings in 60 s; 3c/7 w10 odd: 30 vs 27), so `auto` still switches to split at width 12.
 
@@ -303,6 +305,16 @@ clang -std=c11 -O3 -mcpu=native -Xpreprocessor -fopenmp -I$(brew --prefix libomp
 ```
 
 Measured against Homebrew gcc-16 on an M4 Pro, single thread, same searches: c/5 w8 odd 5.6 → 5.1 s, c/4 w9 even 11.5 → 11.0 s, c/6 w7 even 12.0 → 10.9 s, c/5 w12 even 35.0 → 29.3 s to the 3rd deepening (4–16% faster) [measured]. The output is the same; the regression passes with both compilers [verified].
+
+Two other build options were measured (single thread, 3 interleaved runs each) [measured]:
+- **`-flto`:** no reliable gain. qfind is one translation unit (`qfind.c` includes `common.h`), so there is nothing extra to optimize across files. gcc: c/5 w8 odd 5.7 → 5.6 s, c/6 w7 even 10.9 → 12.0 s; clang: 5.1 → 4.8 s and 10.7 → 10.7 s.
+- **Profile-guided optimization with clang** (`-fprofile-instr-generate`, run a few short searches, `xcrun llvm-profdata merge`, rebuild with `-fprofile-instr-use`): 0–9% faster (c/4 w9 even 1.09×, 2c/7 w7 odd 1.05×, c/6 w7 even 1.03×, c/5 w8 odd 1.00×). Optional; it adds a build step for a small gain.
+
+### 3.12 Prefetching split-cache entries
+
+With a 1 GB cache almost every lookup misses the CPU caches, and `lookAheadSplit()` did its lookups one after another, each waiting for memory. It now first computes the address of every entry the test may read (one per half of row11, for each allowed overlap value) and asks the CPU to start loading them (`splitPrefetch()`, two cache lines per 144-byte entry), then does the test as before. The memory accesses overlap.
+
+Measured (single thread, c/5 w12 even, time to the 4th deepening, two rounds): 59.7 / 59.5 s without, 49.8 / 51.6 s with prefetching, about 1.15–1.2× faster [measured]. Prefetching only changes timing, so the answers are unchanged (same checks as 3.10, rerun with this change: 0 `-DLA_VERIFY` mismatches with 4 threads and `--split-cache-bits 10`; the regression searches identical to the original, standard and with `--lookahead-method split`, clang and gcc) [verified].
 
 ---
 
@@ -521,6 +533,12 @@ On valid input none of these fixes changes which ships are found. The one qualif
 | Bitset AND for the pair-mode row22 test (union of row22 lists as a 2^width-bit set, ANDed with table33's mask) | Exact, but 10–15% slower (c/6 w7 even 9.5→11.3 s; c/4 w9 even 11.7→12.7 s): lists are short and the first entry usually hits [measured] |
 | Half-relaxed deepening test: before a full depth-first search, check that the low half and the high half can each be extended on their own (overlap bits free), memoized by half-state across the whole search | Motivated by a measurement: in dead depth-first searches, full nodes ÷ (distinct low-half + distinct high-half row sequences) grows with width (c/5 even: 0.65 at w7, 1.1 at w9, 2.3 at w11, 3.5 at w12, 6.7 at w13), so the search repeats much of each half's work for every variant of the other half. The test is sound (it never failed on a live node), but with free overlap bits each half is too loose: it caught 31% of dead nodes at w8, 11% at w10 and 0% at w11–13 [measured]. The dead ends come from the halves interacting, so exploiting the redundancy needs the overlap sequences matched exactly, which amounts to a column-based (LLSSS-style) search. Not built |
 | Output-sensitive candidate generation (produce only rows that pass stage 0, column by column) | Candidates per node grow about 1.45× per width (c/5 even: 5.4 at w7, 13 at w10, 50 at w13) while stage-0 survivors stay at 2.4–4.6, so the saving would grow with width; but at w12–13 reading candidates is only 2–4% of the time [measured]. Not built |
+| Exact split search (low-half search recording overlap-bit sequences, then high half restricted to them), pruned only by half tables and half stage 0 | Joining is cheap (high half 12–4,700 nodes), but without the full lookahead the low half explodes (6–4,600× the nodes of the real search) and proves only 0–38% of dead nodes dead (0% on large dead searches) [measured, c/5, c/4, 3c/7 at w10–13]. Would need the lookahead inside each half, i.e. a column-decomposed rewrite of `depthFirst()` |
+| Decision-diagram (BDD) queue, columns interleaved | On real queues (`-q 20`, about 131k states) the diagram is smaller than the list only for shallow queues (depth 4–5: 1.15, 1.81, 3.19 states per node at w9, w11, w13) and larger for deeper ones (w9 depth 10: 0.42; w11 depth 5: 0.85) [measured]. Not built |
+| Merging horizontally shifted duplicate states in asymmetric searches | 0–12% of the queue at w8–9, 0–0.5% at w10 [measured]. Not built |
+| Per-level "goal sets" in the per-pair cone lookahead (for each row12, the union of the table masks over all row13/row23, built once per level as a bitset; each candidate then needs only bit tests) | Exact (0 `-DLA_VERIFY` mismatches), but 12–17% slower; built only on a row12's second use, still 5–18% slower. The early exit usually finds a row33 within the first few tests [measured] |
+| Prefetching per-pair table masks in the cone lookahead | No measurable change (c/5 w9 odd 118.5 vs 118.7 s, c/4 w9 even 11.2 vs 11.0 s) [measured]. Removed |
+| Per-pair tables at width 10 (about 1.4 GB) instead of factored | Slower on the M4 Pro: c/5 w10 even 14 deepenings in 86.5 s vs 16 in 80.2 s factored; c/4 w10 odd 30 in 89.5 s vs 35 in 83.9 s (building the tables costs several seconds up front) [measured]. `auto` unchanged |
 | Persistent failed-state memo across deepenings (state = last 2·period rows + phase, kept between passes) | Hit rate only 0.02–2.6% of lookups (c/5 w8 odd 997 / 4.0M; c/6 w7 even 13k / 16M; c/4 w8 even 43k / 1.6M) [measured]; not worth building |
 | Hybrid tables (per-pair until a memory budget, then factored) | 11–22% slower even when all tables fit (a branch in the hot loop), and slower than pure factored at widths 10–12 [measured]. Replaced by choosing one representation per search |
 | Split-lookahead speed-ups: per-half code specialization (25% fewer instructions, same time), a larger split cache (2^20–2^22 entries: about 12% faster at width 8, not adopted), a small per-level cache of half-cone sets | no gain or within noise [measured] |

@@ -1,5 +1,5 @@
 --- original-2.4b/qfind.c	2026-10-17 11:16:42
-+++ current/qfind.c	2026-10-17 13:43:55
++++ current/qfind.c	2026-10-17 15:57:38
 @@ -5,6 +5,22 @@
  ** Based on code by David Eppstein, zdr, Paul Tooke, and Tomas Rokicki.
  ** Thanks also to Frank Everdij, Adam P. Goucher, Alex Greason, and
@@ -256,7 +256,7 @@
  #endif
                       return 1;
                    }
-@@ -222,11 +288,614 @@
+@@ -222,11 +288,630 @@
        }
     }
  #ifndef NOCACHE
@@ -764,6 +764,15 @@
 +      atomic_store(&splitCache[0], low);
 +   }
 +}
++/* start loading the cache entry of (this level's context, u11) */
++static inline void splitPrefetch(const SplitLevel *sl, int high, int u11) {
++   SplitCacheEntry *tab = atomic_load_explicit(&splitCache[high], memory_order_acquire);
++   if (__builtin_expect(!tab, 0)) return;
++   const uint64_t key = ((high ? sl->ctxH : sl->ctxL) << 8) | (uint64_t)u11;
++   const char *e = (const char *)&tab[(key * 0x9E3779B97F4A7C15ULL) >> (64 - splitCacheBits)];
++   __builtin_prefetch(e);
++   __builtin_prefetch(e + sizeof(SplitCacheEntry) - 1);   /* an entry can span two cache lines */
++}
 +/* acc |= half-cone set of (this level's context, u11) */
 +static inline void splitMemoOr(SplitLevel *sl, int high, int u11, uint64_t *acc) {
 +   SplitCacheEntry *tab = atomic_load_explicit(&splitCache[high], memory_order_acquire);
@@ -816,6 +825,13 @@
 +   const uint16_t *offH = highHalfOffsets + (size_t)sl->highA * HIGH_OFFSETS_PER_PAIR + (candHigh << 2);
 +   const uint8_t *rowsL = lowHalfRows + ((size_t)sl->lowA << lowHalfBits);
 +   const uint8_t *rowsH = highHalfRows + ((size_t)sl->highA << highHalfBits);
++   /* The cache is large, so most lookups miss the CPU caches.  Request every entry this
++   ** test may read first, so the memory accesses overlap instead of running one by one. */
++   for (int v = 0; v < 4; v++) {
++      if (!((common >> v) & 1)) continue;
++      for (int i = offL[v]; i < offL[v + 1]; i++) splitPrefetch(sl, 0, rowsL[i]);
++      for (int i = offH[v]; i < offH[v + 1]; i++) splitPrefetch(sl, 1, rowsH[i]);
++   }
 +   for (int v = 0; v < 4; v++) {
 +      if (!((common >> v) & 1)) continue;
 +      uint64_t unionL[OVSET_WORDS] = {0}, unionH[OVSET_WORDS] = {0};
@@ -872,7 +888,7 @@
  /* Testing for subperiodic patterns
  **
  ** For each possible phase of the ship, equivRow[0][phase] gives the row that 
-@@ -278,24 +947,24 @@
+@@ -278,24 +963,24 @@
     }
  }
  
@@ -905,7 +921,7 @@
              return 0;
           a -= period;
           b -= period;
-@@ -304,7 +973,7 @@
+@@ -304,7 +989,7 @@
        for (i=0; i < (nodeRow - b); i++) z = PARENT(z);
        
        if (a > nodeRow){
@@ -914,7 +930,7 @@
              return 0;
           a -= period;
           for (i=0; i < period; i++)
-@@ -319,7 +988,7 @@
+@@ -319,7 +1004,7 @@
        for (i=0; i < -1 * a; i++)
           y = PARENT(y);
        z = y;
@@ -923,7 +939,7 @@
           z = PARENT(z);
     }
     
-@@ -335,11 +1004,11 @@
+@@ -335,11 +1020,11 @@
     return 1;
  }
  
@@ -937,7 +953,7 @@
        return 1;
     
     return 0;
-@@ -352,34 +1021,87 @@
+@@ -352,34 +1037,87 @@
  ** child nodes.  Spaceships are detected by a call to terminal().
  */
  
@@ -1009,29 +1025,28 @@
 +      pathRows[i] = ROW(x);
        x = PARENT(x);
     }
--   
--   ++pPhase;
--   if (pPhase == period) pPhase = 0;
 +   laForgetLevel(currRow);   /* new parent node: forget cached lookahead context */
 +   /* lookahead results computed in parallel by bfsPrecompute(), if available */
 +   const uint8_t *pre = 0;
 +   if (preCursor < preN && preNodes[preCursor] == theNode) pre = preRes + (size_t)preCursor++ * DECODE_CAP;
+    
+-   ++pPhase;
+-   if (pPhase == period) pPhase = 0;
++   ++rowPhase;
++   if (rowPhase == period) rowPhase = 0;
     
 -   getoffsetcount( pRows[currRow - 2 * PERIOD],
 -                   pRows[currRow - PERIOD],
 -                   pRows[currRow - PERIOD + BACKOFF(pPhase)],
 -                   &riStart,
 -                   &numRows );
-+   ++rowPhase;
-+   if (rowPhase == period) rowPhase = 0;
-    
 +   getSuccessors( pathRows[currRow - 2 * PERIOD],
 +                   pathRows[currRow - PERIOD],
 +                   pathRows[currRow - PERIOD + BACKOFF(rowPhase)],
 +                   &candidates,
 +                   &numCandidates,
 +                   levelDecodeBuf(currRow) );
-+   
+    
     /* we just ran dequeue() which changed DeepQHead so */
     /* we need to look at the previous head location    */
 -   uint32_t deepIndex = deepRowIndices[oldDeepQHead];
@@ -1039,7 +1054,7 @@
     
     if (theNode == 0){
        firstRow = 1;
-@@ -389,54 +1111,62 @@
+@@ -389,54 +1127,62 @@
        /* Sanity check: do the extension rows match the node rows? */
        node y = theNode;
        for (i = 0; i < 2*period; ++i){
@@ -1124,7 +1139,7 @@
           if (currentDepth() > longest){
              if (params[P_LONGEST]) bufferPattern(qTail-1, NULL, 0, 0, 0);
              longest = currentDepth();
-@@ -447,72 +1177,74 @@
+@@ -447,72 +1193,74 @@
     }
  }
  
@@ -1235,7 +1250,7 @@
              fprintf(stderr, "Warning: non-matching rows detected at node %u in depthFirst()\n",theNode);
              matchFlag = 0;
              break;
-@@ -520,37 +1252,51 @@
+@@ -520,37 +1268,51 @@
           y = PARENT(y);
        }
        
@@ -1308,7 +1323,7 @@
  #endif
           if (currRow < startRow) return 0;
           
-@@ -558,15 +1304,27 @@
+@@ -558,15 +1320,27 @@
        }
        
        /* Check next row with fixed-depth look ahead and add it if it passes */
@@ -1342,7 +1357,7 @@
  #endif
        
        /* Test for early exit conditions */
-@@ -575,10 +1333,10 @@
+@@ -575,10 +1349,10 @@
                 && atomic_load_explicit(remainingItems, memory_order_relaxed) < earlyExit
                 && atomic_load_explicit(passed, memory_order_relaxed) ) )
           {
@@ -1355,7 +1370,7 @@
           return 1;
        }
        
-@@ -588,28 +1346,28 @@
+@@ -588,28 +1362,28 @@
           /* Increment successful depth-first counter (used in early exit check) */
           atomic_fetch_add_explicit(passed, 1, memory_order_relaxed);
  
@@ -1390,7 +1405,7 @@
           }
           if (aborting)  /* Flag for early exit if the desired number of ships has been found */
              atomic_store_explicit(forceExit, 1, memory_order_seq_cst);
-@@ -617,11 +1375,11 @@
+@@ -617,11 +1391,11 @@
        }
        
        /* Get the list of successor rows based on the newly added row */
@@ -1407,7 +1422,7 @@
     }
  }
  
-@@ -632,19 +1390,7 @@
+@@ -632,19 +1406,7 @@
     parseOptions(argc, argv);
     searchSetup();
     
@@ -1428,7 +1443,7 @@
     
     printf("Starting search\n");
     fflush(stdout);
-@@ -652,6 +1398,5 @@
+@@ -652,6 +1414,5 @@
     breadthFirst();
     
     finalReport();

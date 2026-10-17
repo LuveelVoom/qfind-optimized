@@ -130,12 +130,18 @@ All measured; the numbers are in CHANGES.md section 9.
 5. He wants changes kept limited so he can follow the differences.
 
 **Ideas suggested but not done:**
-- **`--tables auto` choosing by available RAM:** use per-pair tables at widths 10–11 when they fit in memory. Easy, and recovers about 2× at width 10.
+- **`--tables auto` choosing by available RAM:** measured on the M4 Pro (2026-10-17), per-pair tables at width 10 were *slower* than factored (CHANGES.md §9), so this is no longer expected to help.
 - **Running several settings at once and keeping the first ship** (different `-i`, `-q`, `--lookahead-depth`, `--tables` on separate cores or machines): a script only; probably 1.5–3× faster time to the first ship.
 - **Distributing `-j` split pieces across machines:** a script only.
 - **Packing hot tables together in memory:** maybe 1.1–1.3×.
 - **Tail-completion check:** report ships a few rows earlier; no pruning.
 - **Testing `bfsPrecompute`** on a machine with 4+ cores.
+
+**Next steps (2026-10-17; the machine was busy with another search, so only single-thread tests were run):**
+1. **Multi-thread efficiency (likely the largest remaining real-world gain).** At 10 threads, c/3 w10 even kept only 3.4 cores busy (5.2 at 20 threads) because the breadth-first step is mostly serial and its deepenings are short. Profile a multi-threaded run on an idle machine and parallelize what is serial.
+2. **Parallel batch testing.** On an idle machine, test many constant-factor ideas at once (8–10 single-thread runs in parallel) with clean timings, instead of one at a time.
+3. **Clean re-measurement** of the multi-thread numbers in CHANGES.md §3.10 (they ran under load).
+4. **Deferred experiments:** a SAT (kissat) fallback for large dead depth-first searches (measured ceiling 1.1–1.7×; 45-min go/no-go first), and a 4-generation lookahead measurement (about 1.5–2 h). Width-scaling ideas already ruled out are listed in CHANGES.md §9.
 
 ## 8. User preferences (follow these)
 

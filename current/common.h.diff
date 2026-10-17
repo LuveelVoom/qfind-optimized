@@ -1,5 +1,5 @@
 --- original-2.4b/common.h	2026-10-17 11:16:42
-+++ current/common.h	2026-10-17 13:43:39
++++ current/common.h	2026-10-17 15:36:05
 @@ -4,12 +4,18 @@
  ** determined by the presence of the macro QSIMPLE defined in qfind-s.c.
  */
@@ -637,7 +637,7 @@
 +int useSplitLookahead = 0;   /* chosen for this search: 0 = cone, 1 = split, 2 = hybrid (1, 2 need the half-tables) */
 +long lookaheadBudget = LOOKAHEAD_BUDGET;   /* --lookahead-budget: work units before the hybrid switches to split */
 +#ifndef SPLIT_CACHE_BITS
-+#define SPLIT_CACHE_BITS 20
++#define SPLIT_CACHE_BITS 22
 +#endif
 +int splitCacheBits = SPLIT_CACHE_BITS;     /* --split-cache-bits: 2^N shared split-cache entries per half */
 +static int lowHalfBits, lowResultBits, highHalfShift, highHalfBits, highResultBits;

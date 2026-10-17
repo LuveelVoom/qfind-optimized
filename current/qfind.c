@@ -791,6 +791,15 @@ static void splitCacheAlloc(void) {
       atomic_store(&splitCache[0], low);
    }
 }
+/* start loading the cache entry of (this level's context, u11) */
+static inline void splitPrefetch(const SplitLevel *sl, int high, int u11) {
+   SplitCacheEntry *tab = atomic_load_explicit(&splitCache[high], memory_order_acquire);
+   if (__builtin_expect(!tab, 0)) return;
+   const uint64_t key = ((high ? sl->ctxH : sl->ctxL) << 8) | (uint64_t)u11;
+   const char *e = (const char *)&tab[(key * 0x9E3779B97F4A7C15ULL) >> (64 - splitCacheBits)];
+   __builtin_prefetch(e);
+   __builtin_prefetch(e + sizeof(SplitCacheEntry) - 1);   /* an entry can span two cache lines */
+}
 /* acc |= half-cone set of (this level's context, u11) */
 static inline void splitMemoOr(SplitLevel *sl, int high, int u11, uint64_t *acc) {
    SplitCacheEntry *tab = atomic_load_explicit(&splitCache[high], memory_order_acquire);
@@ -843,6 +852,13 @@ static int lookAheadSplit(row *pathRows, int candRow, int rowPhase) {
    const uint16_t *offH = highHalfOffsets + (size_t)sl->highA * HIGH_OFFSETS_PER_PAIR + (candHigh << 2);
    const uint8_t *rowsL = lowHalfRows + ((size_t)sl->lowA << lowHalfBits);
    const uint8_t *rowsH = highHalfRows + ((size_t)sl->highA << highHalfBits);
+   /* The cache is large, so most lookups miss the CPU caches.  Request every entry this
+   ** test may read first, so the memory accesses overlap instead of running one by one. */
+   for (int v = 0; v < 4; v++) {
+      if (!((common >> v) & 1)) continue;
+      for (int i = offL[v]; i < offL[v + 1]; i++) splitPrefetch(sl, 0, rowsL[i]);
+      for (int i = offH[v]; i < offH[v + 1]; i++) splitPrefetch(sl, 1, rowsH[i]);
+   }
    for (int v = 0; v < 4; v++) {
       if (!((common >> v) & 1)) continue;
       uint64_t unionL[OVSET_WORDS] = {0}, unionH[OVSET_WORDS] = {0};
