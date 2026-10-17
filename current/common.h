@@ -705,6 +705,10 @@ int tableMode = 0;           /* --tables: 0 = auto, 1 = per-pair, 2 = factored *
 int lookaheadMethod = 0;     /* --lookahead-method: 0 = auto, 1 = cone, 2 = split, 3 = hybrid */
 int useSplitLookahead = 0;   /* chosen for this search: 0 = cone, 1 = split, 2 = hybrid (1, 2 need the half-tables) */
 long lookaheadBudget = LOOKAHEAD_BUDGET;   /* --lookahead-budget: work units before the hybrid switches to split */
+#ifndef SPLIT_CACHE_BITS
+#define SPLIT_CACHE_BITS 20
+#endif
+int splitCacheBits = SPLIT_CACHE_BITS;     /* --split-cache-bits: 2^N shared split-cache entries per half */
 static int lowHalfBits, lowResultBits, highHalfShift, highHalfBits, highResultBits;
 static uint8_t *lowHalfRows, *highHalfRows, *lowHalfMasks, *highHalfMasks;
 static uint16_t *lowHalfOffsets, *highHalfOffsets;
@@ -2314,6 +2318,10 @@ void printHelp(void) {
           "                                to split when a test gets expensive.\n");
    printf("  --lookahead-budget <N>        hybrid: work units before switching to split\n"
           "                                (default: 256).\n");
+   printf("  --split-cache-bits <N>        split and hybrid: 2^N cache entries per half,\n"
+          "                                shared by all threads (default: %d = %d MB).\n"
+          "                                Larger is faster at width 11 and above.\n",
+          SPLIT_CACHE_BITS, (int)((288LL << SPLIT_CACHE_BITS) >> 20));
    printf("\n");
    printf("Memory options:\n");
    printf("  -c, --cache-mem <number>      allocate N megabytes per thread for a lookahead\n"
@@ -2438,6 +2446,7 @@ void echoParams(void) {
    if (lookaheadDepth != 3) printf("Lookahead depth: %d\n", lookaheadDepth);
    printf("Lookup tables: %s\n", useFactored ? "factored (two global half-tables)" : "one per row pair");
    if (lookaheadDepth == 3) printf("Lookahead method: %s\n", useSplitLookahead == 1 ? "split (half-row cones)" : useSplitLookahead == 2 ? "hybrid (cone, split when expensive)" : "cone (full rows)");
+   if (lookaheadDepth == 3 && useSplitLookahead) printf("Split lookahead cache: %lld MB, shared by all threads (--split-cache-bits %d)\n", (288LL << splitCacheBits) >> 20, splitCacheBits);
    printf("\n");
 }
 
@@ -3214,6 +3223,7 @@ void parseOptions(int argc, char *argv[]) {
       {"tables",              required_argument, 268},
       {"lookahead-method",    required_argument, 269},
       {"lookahead-budget",    required_argument, 270},
+      {"split-cache-bits",    required_argument, 271},
       {0, 0, 0}   /* marks end of long options list */
    };
    
@@ -3409,6 +3419,10 @@ void parseOptions(int argc, char *argv[]) {
          case 270:   /* --lookahead-budget N */
             lookaheadBudget = readInt(optName, optArg);
             if (lookaheadBudget < 0) printError("lookahead budget must be nonnegative.");
+            break;
+         case 271:   /* --split-cache-bits N */
+            splitCacheBits = readInt(optName, optArg);
+            if (splitCacheBits < 8 || splitCacheBits > 30) printError("split cache bits must be between 8 and 30.");
             break;
          case 269:   /* --lookahead-method auto|cone|split|hybrid */
             if (!optArg) printError("missing argument for --lookahead-method");

@@ -20,8 +20,14 @@ every ship within the search limits. Discussed in the ConwayLife.com thread "qfi
 gcc -std=c11 -fopenmp -march=native -O3 -DINNER_SPLIT -o qfind current/qfind.c
 ```
 
-On a Mac use Homebrew `gcc-14` (Apple clang has no OpenMP; without `-fopenmp` it runs single-threaded).
-On Apple Silicon use `-mcpu=native` if `-march=native` fails.
+On a Mac, Apple clang with Homebrew's `libomp` is the fastest build (4–16% faster than gcc, which emulates
+thread-local storage on macOS; see `current/CHANGES.md` section 3.11):
+
+```
+brew install libomp
+clang -std=c11 -O3 -mcpu=native -Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include \
+      -L$(brew --prefix libomp)/lib -lomp -DINNER_SPLIT -o qfind current/qfind.c
+```
 
 ## Test
 

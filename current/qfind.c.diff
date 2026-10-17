@@ -1,5 +1,5 @@
---- original-2.4b/qfind.c	2026-10-17 18:16:42.870593381 +0000
-+++ current/qfind.c	2026-10-17 18:16:42.867270314 +0000
+--- original-2.4b/qfind.c	2026-10-17 11:16:42
++++ current/qfind.c	2026-10-17 13:43:55
 @@ -5,6 +5,22 @@
  ** Based on code by David Eppstein, zdr, Paul Tooke, and Tomas Rokicki.
  ** Thanks also to Frank Everdij, Adam P. Goucher, Alex Greason, and
@@ -256,7 +256,7 @@
  #endif
                       return 1;
                    }
-@@ -222,11 +288,593 @@
+@@ -222,11 +288,614 @@
        }
     }
  #ifndef NOCACHE
@@ -429,7 +429,7 @@
 +   }
 +   return 0;
 +}
-+#endif
+ #endif
 +#ifdef INNER_SPLIT
 +#define DECODE_CAP_MAX ((1 << 14) + 8)
 +/* Innermost cone test in factored mode, on half-tables: does some row23 in
@@ -468,8 +468,8 @@
 +         if (aL & aH) return 1;
 +      }
 +   }
-+   return 0;
-+}
+    return 0;
+ }
 +#endif
 +static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, int candRow, int rowPhase, const int factored){
 +#ifndef QSIMPLE
@@ -573,7 +573,7 @@
 +   }
 +   return 0;
 +}
-+
+ 
 +
 +/* ========================================================================== *
 +** Split lookahead (--lookahead-method split)
@@ -599,7 +599,7 @@
 +** Bookkeeping: for a given low half u11L of row11, the set of overlap vectors
 +** (row12, row13, row22, row23, row33; 2 bits each = 10 bits = a 1024-bit set) for
 +** which a low-half cone exists depends only on half-rows (see splitBuild), so it is
-+** kept in a per-thread cache shared by all levels (splitMemo); same for the high half.
++** kept in a cache shared by all levels and threads (splitMemoOr); same for the high half.
 +** A candidate passes iff for some overlap value v of row11, the union of the low
 +** sets over the low-half row11 choices with overlap v intersects the union of the
 +** high sets over the high-half row11 choices with overlap v.
@@ -744,24 +744,51 @@
 +   else      splitHalfSetT(sl, u11, set, 0);
 +}
 +
-+/* Per-thread direct-mapped cache of half-cone sets, keyed by (context, row11 half).
-+** Shared by every level and node: half-rows repeat far more often than full rows.  */
-+#define SPLIT_CACHE_BITS 16
-+typedef struct { uint64_t key; uint64_t set[OVSET_WORDS]; } SplitCacheEntry;
-+static _Thread_local SplitCacheEntry *splitCache[2];
-+static inline const uint64_t *splitMemo(SplitLevel *sl, int high, int u11) {
-+   if (__builtin_expect(!splitCache[high], 0)) {
-+      splitCache[high] = (SplitCacheEntry*)malloc(sizeof(SplitCacheEntry) << SPLIT_CACHE_BITS);
-+      for (size_t i = 0; i < ((size_t)1 << SPLIT_CACHE_BITS); i++) splitCache[high][i].key = ~(uint64_t)0;
++/* Direct-mapped cache of half-cone sets, keyed by (context, row11 half), with
++** 2^splitCacheBits entries per half (--split-cache-bits).  Shared by every level, node
++** and thread: half-rows repeat far more often than full rows, and threads reuse each
++** other's sets.  Each entry has a sequence counter (a seqlock): 0 = never written, odd =
++** being written.  A writer makes it odd while it writes; a reader that sees it odd or
++** changed treats the entry as missing and computes the set itself, so a torn entry is
++** never used.  A thread that loses the race to write an entry just doesn't store it.  */
++typedef struct { uint64_t seq, key; uint64_t set[OVSET_WORDS]; } SplitCacheEntry;
++static SplitCacheEntry *_Atomic splitCache[2];
++static void splitCacheAlloc(void) {
++   #pragma omp critical(splitCacheAlloc)
++   if (!atomic_load(&splitCache[0])) {
++      const size_t n = (size_t)1 << splitCacheBits;
++      SplitCacheEntry *low = (SplitCacheEntry*)calloc(n, sizeof(SplitCacheEntry));
++      SplitCacheEntry *high = (SplitCacheEntry*)calloc(n, sizeof(SplitCacheEntry));
++      if (!low || !high) { fprintf(stderr, "Unable to allocate the split lookahead cache (--split-cache-bits %d)\n", splitCacheBits); exit(1); }
++      atomic_store(&splitCache[1], high);
++      atomic_store(&splitCache[0], low);
 +   }
++}
++/* acc |= half-cone set of (this level's context, u11) */
++static inline void splitMemoOr(SplitLevel *sl, int high, int u11, uint64_t *acc) {
++   SplitCacheEntry *tab = atomic_load_explicit(&splitCache[high], memory_order_acquire);
++   if (__builtin_expect(!tab, 0)) { splitCacheAlloc(); tab = atomic_load(&splitCache[high]); }
 +   const uint64_t key = ((high ? sl->ctxH : sl->ctxL) << 8) | (uint64_t)u11;   /* <= 64 bits */
-+   uint64_t h = key * 0x9E3779B97F4A7C15ULL;
-+   SplitCacheEntry *e = &splitCache[high][h >> (64 - SPLIT_CACHE_BITS)];
-+   if (e->key != key) {
-+      splitHalfSet(sl, high, u11, e->set);
-+      e->key = key;
++   SplitCacheEntry *e = &tab[(key * 0x9E3779B97F4A7C15ULL) >> (64 - splitCacheBits)];
++   const uint64_t seq = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
++   if (seq && !(seq & 1) && __atomic_load_n(&e->key, __ATOMIC_RELAXED) == key) {
++      uint64_t got[OVSET_WORDS];
++      for (int w = 0; w < OVSET_WORDS; w++) got[w] = __atomic_load_n(&e->set[w], __ATOMIC_RELAXED);
++      __atomic_thread_fence(__ATOMIC_ACQUIRE);
++      if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) == seq) {
++         for (int w = 0; w < OVSET_WORDS; w++) acc[w] |= got[w];
++         return;
++      }
 +   }
-+   return e->set;
++   uint64_t set[OVSET_WORDS];
++   splitHalfSet(sl, high, u11, set);
++   for (int w = 0; w < OVSET_WORDS; w++) acc[w] |= set[w];
++   uint64_t old = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
++   if (!(old & 1) && __atomic_compare_exchange_n(&e->seq, &old, old + 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++      __atomic_store_n(&e->key, key, __ATOMIC_RELAXED);
++      for (int w = 0; w < OVSET_WORDS; w++) __atomic_store_n(&e->set[w], set[w], __ATOMIC_RELAXED);
++      __atomic_store_n(&e->seq, old + 2, __ATOMIC_RELEASE);
++   }
 +}
 +
 +static void splitForgetLevel(int level) {
@@ -776,7 +803,7 @@
 +   if (TRIPLEOFF(rowPhase) == PERIOD) return lookAheadReference(pathRows, candRow, rowPhase);
 +#elif 3*OFFSET == PERIOD
 +   return lookAheadReference(pathRows, candRow, rowPhase);
- #endif
++#endif
 +   SplitLevel *sl = splitGetLevel(candRow);
 +   if (__builtin_expect(!sl->built, 0)) splitBuild(sl, pathRows, candRow, rowPhase);
 +   const int cand = pathRows[candRow];
@@ -792,21 +819,15 @@
 +   for (int v = 0; v < 4; v++) {
 +      if (!((common >> v) & 1)) continue;
 +      uint64_t unionL[OVSET_WORDS] = {0}, unionH[OVSET_WORDS] = {0};
-+      for (int i = offL[v]; i < offL[v + 1]; i++) {
-+         const uint64_t *s = splitMemo(sl, 0, rowsL[i]);
-+         for (int w = 0; w < OVSET_WORDS; w++) unionL[w] |= s[w];
-+      }
-+      for (int i = offH[v]; i < offH[v + 1]; i++) {
-+         const uint64_t *s = splitMemo(sl, 1, rowsH[i]);
-+         for (int w = 0; w < OVSET_WORDS; w++) unionH[w] |= s[w];
-+      }
++      for (int i = offL[v]; i < offL[v + 1]; i++) splitMemoOr(sl, 0, rowsL[i], unionL);
++      for (int i = offH[v]; i < offH[v + 1]; i++) splitMemoOr(sl, 1, rowsH[i], unionH);
 +      uint64_t any = 0;
 +      for (int w = 0; w < OVSET_WORDS; w++) any |= unionL[w] & unionH[w];
 +      if (any) return 1;
 +   }
-    return 0;
- }
- 
++   return 0;
++}
++
 +static int lookAheadFastPair(row *pathRows, int candRow, int rowPhase) { return lookAheadFastT(pathRows, candRow, rowPhase, 0); }
 +static int lookAheadFastFactored(row *pathRows, int candRow, int rowPhase) { return lookAheadFastT(pathRows, candRow, rowPhase, 1); }
 +static inline int lookAheadFast(row *pathRows, int candRow, int rowPhase) {
@@ -851,7 +872,7 @@
  /* Testing for subperiodic patterns
  **
  ** For each possible phase of the ship, equivRow[0][phase] gives the row that 
-@@ -278,24 +926,24 @@
+@@ -278,24 +947,24 @@
     }
  }
  
@@ -884,7 +905,7 @@
              return 0;
           a -= period;
           b -= period;
-@@ -304,7 +952,7 @@
+@@ -304,7 +973,7 @@
        for (i=0; i < (nodeRow - b); i++) z = PARENT(z);
        
        if (a > nodeRow){
@@ -893,7 +914,7 @@
              return 0;
           a -= period;
           for (i=0; i < period; i++)
-@@ -319,7 +967,7 @@
+@@ -319,7 +988,7 @@
        for (i=0; i < -1 * a; i++)
           y = PARENT(y);
        z = y;
@@ -902,7 +923,7 @@
           z = PARENT(z);
     }
     
-@@ -335,11 +983,11 @@
+@@ -335,11 +1004,11 @@
     return 1;
  }
  
@@ -916,7 +937,7 @@
        return 1;
     
     return 0;
-@@ -352,34 +1000,87 @@
+@@ -352,34 +1021,87 @@
  ** child nodes.  Spaceships are detected by a call to terminal().
  */
  
@@ -991,27 +1012,26 @@
 -   
 -   ++pPhase;
 -   if (pPhase == period) pPhase = 0;
--   
++   laForgetLevel(currRow);   /* new parent node: forget cached lookahead context */
++   /* lookahead results computed in parallel by bfsPrecompute(), if available */
++   const uint8_t *pre = 0;
++   if (preCursor < preN && preNodes[preCursor] == theNode) pre = preRes + (size_t)preCursor++ * DECODE_CAP;
+    
 -   getoffsetcount( pRows[currRow - 2 * PERIOD],
 -                   pRows[currRow - PERIOD],
 -                   pRows[currRow - PERIOD + BACKOFF(pPhase)],
 -                   &riStart,
 -                   &numRows );
-+   laForgetLevel(currRow);   /* new parent node: forget cached lookahead context */
-+   /* lookahead results computed in parallel by bfsPrecompute(), if available */
-+   const uint8_t *pre = 0;
-+   if (preCursor < preN && preNodes[preCursor] == theNode) pre = preRes + (size_t)preCursor++ * DECODE_CAP;
-+   
 +   ++rowPhase;
 +   if (rowPhase == period) rowPhase = 0;
-+   
+    
 +   getSuccessors( pathRows[currRow - 2 * PERIOD],
 +                   pathRows[currRow - PERIOD],
 +                   pathRows[currRow - PERIOD + BACKOFF(rowPhase)],
 +                   &candidates,
 +                   &numCandidates,
 +                   levelDecodeBuf(currRow) );
-    
++   
     /* we just ran dequeue() which changed DeepQHead so */
     /* we need to look at the previous head location    */
 -   uint32_t deepIndex = deepRowIndices[oldDeepQHead];
@@ -1019,7 +1039,7 @@
     
     if (theNode == 0){
        firstRow = 1;
-@@ -389,54 +1090,62 @@
+@@ -389,54 +1111,62 @@
        /* Sanity check: do the extension rows match the node rows? */
        node y = theNode;
        for (i = 0; i < 2*period; ++i){
@@ -1104,7 +1124,7 @@
           if (currentDepth() > longest){
              if (params[P_LONGEST]) bufferPattern(qTail-1, NULL, 0, 0, 0);
              longest = currentDepth();
-@@ -447,72 +1156,74 @@
+@@ -447,72 +1177,74 @@
     }
  }
  
@@ -1215,7 +1235,7 @@
              fprintf(stderr, "Warning: non-matching rows detected at node %u in depthFirst()\n",theNode);
              matchFlag = 0;
              break;
-@@ -520,37 +1231,51 @@
+@@ -520,37 +1252,51 @@
           y = PARENT(y);
        }
        
@@ -1244,7 +1264,7 @@
 -            deepRows[theDeepIndex] = 0;
 -         }
 +         rowPhase = (rowPhase + currRow - startRow) % period;
-+      }
+       }
 +      else if (matchFlag)
 +         fprintf(stderr, "Warning: invalid extension row at node %u in depthFirst()\n",theNode);
 +      
@@ -1253,7 +1273,7 @@
 +      {
 +         free(extensionRows[extIndex]);
 +         extensionRows[extIndex] = 0;
-       }
++      }
     }
     
 -   deepRowIndices[deepQHead + theNode - qHead] = 0;
@@ -1288,7 +1308,7 @@
  #endif
           if (currRow < startRow) return 0;
           
-@@ -558,15 +1283,27 @@
+@@ -558,15 +1304,27 @@
        }
        
        /* Check next row with fixed-depth look ahead and add it if it passes */
@@ -1322,7 +1342,7 @@
  #endif
        
        /* Test for early exit conditions */
-@@ -575,10 +1312,10 @@
+@@ -575,10 +1333,10 @@
                 && atomic_load_explicit(remainingItems, memory_order_relaxed) < earlyExit
                 && atomic_load_explicit(passed, memory_order_relaxed) ) )
           {
@@ -1335,7 +1355,7 @@
           return 1;
        }
        
-@@ -588,28 +1325,28 @@
+@@ -588,28 +1346,28 @@
           /* Increment successful depth-first counter (used in early exit check) */
           atomic_fetch_add_explicit(passed, 1, memory_order_relaxed);
  
@@ -1370,7 +1390,7 @@
           }
           if (aborting)  /* Flag for early exit if the desired number of ships has been found */
              atomic_store_explicit(forceExit, 1, memory_order_seq_cst);
-@@ -617,11 +1354,11 @@
+@@ -617,11 +1375,11 @@
        }
        
        /* Get the list of successor rows based on the newly added row */
@@ -1387,7 +1407,7 @@
     }
  }
  
-@@ -632,19 +1369,7 @@
+@@ -632,19 +1390,7 @@
     parseOptions(argc, argv);
     searchSetup();
     
@@ -1408,7 +1428,7 @@
     
     printf("Starting search\n");
     fflush(stdout);
-@@ -652,6 +1377,5 @@
+@@ -652,6 +1398,5 @@
     breadthFirst();
     
     finalReport();

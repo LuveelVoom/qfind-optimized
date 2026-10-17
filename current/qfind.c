@@ -626,7 +626,7 @@ static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, i
 ** Bookkeeping: for a given low half u11L of row11, the set of overlap vectors
 ** (row12, row13, row22, row23, row33; 2 bits each = 10 bits = a 1024-bit set) for
 ** which a low-half cone exists depends only on half-rows (see splitBuild), so it is
-** kept in a per-thread cache shared by all levels (splitMemo); same for the high half.
+** kept in a cache shared by all levels and threads (splitMemoOr); same for the high half.
 ** A candidate passes iff for some overlap value v of row11, the union of the low
 ** sets over the low-half row11 choices with overlap v intersects the union of the
 ** high sets over the high-half row11 choices with overlap v.
@@ -771,24 +771,51 @@ static void splitHalfSet(const SplitLevel *sl, int high, int u11, uint64_t *set)
    else      splitHalfSetT(sl, u11, set, 0);
 }
 
-/* Per-thread direct-mapped cache of half-cone sets, keyed by (context, row11 half).
-** Shared by every level and node: half-rows repeat far more often than full rows.  */
-#define SPLIT_CACHE_BITS 16
-typedef struct { uint64_t key; uint64_t set[OVSET_WORDS]; } SplitCacheEntry;
-static _Thread_local SplitCacheEntry *splitCache[2];
-static inline const uint64_t *splitMemo(SplitLevel *sl, int high, int u11) {
-   if (__builtin_expect(!splitCache[high], 0)) {
-      splitCache[high] = (SplitCacheEntry*)malloc(sizeof(SplitCacheEntry) << SPLIT_CACHE_BITS);
-      for (size_t i = 0; i < ((size_t)1 << SPLIT_CACHE_BITS); i++) splitCache[high][i].key = ~(uint64_t)0;
+/* Direct-mapped cache of half-cone sets, keyed by (context, row11 half), with
+** 2^splitCacheBits entries per half (--split-cache-bits).  Shared by every level, node
+** and thread: half-rows repeat far more often than full rows, and threads reuse each
+** other's sets.  Each entry has a sequence counter (a seqlock): 0 = never written, odd =
+** being written.  A writer makes it odd while it writes; a reader that sees it odd or
+** changed treats the entry as missing and computes the set itself, so a torn entry is
+** never used.  A thread that loses the race to write an entry just doesn't store it.  */
+typedef struct { uint64_t seq, key; uint64_t set[OVSET_WORDS]; } SplitCacheEntry;
+static SplitCacheEntry *_Atomic splitCache[2];
+static void splitCacheAlloc(void) {
+   #pragma omp critical(splitCacheAlloc)
+   if (!atomic_load(&splitCache[0])) {
+      const size_t n = (size_t)1 << splitCacheBits;
+      SplitCacheEntry *low = (SplitCacheEntry*)calloc(n, sizeof(SplitCacheEntry));
+      SplitCacheEntry *high = (SplitCacheEntry*)calloc(n, sizeof(SplitCacheEntry));
+      if (!low || !high) { fprintf(stderr, "Unable to allocate the split lookahead cache (--split-cache-bits %d)\n", splitCacheBits); exit(1); }
+      atomic_store(&splitCache[1], high);
+      atomic_store(&splitCache[0], low);
    }
+}
+/* acc |= half-cone set of (this level's context, u11) */
+static inline void splitMemoOr(SplitLevel *sl, int high, int u11, uint64_t *acc) {
+   SplitCacheEntry *tab = atomic_load_explicit(&splitCache[high], memory_order_acquire);
+   if (__builtin_expect(!tab, 0)) { splitCacheAlloc(); tab = atomic_load(&splitCache[high]); }
    const uint64_t key = ((high ? sl->ctxH : sl->ctxL) << 8) | (uint64_t)u11;   /* <= 64 bits */
-   uint64_t h = key * 0x9E3779B97F4A7C15ULL;
-   SplitCacheEntry *e = &splitCache[high][h >> (64 - SPLIT_CACHE_BITS)];
-   if (e->key != key) {
-      splitHalfSet(sl, high, u11, e->set);
-      e->key = key;
+   SplitCacheEntry *e = &tab[(key * 0x9E3779B97F4A7C15ULL) >> (64 - splitCacheBits)];
+   const uint64_t seq = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+   if (seq && !(seq & 1) && __atomic_load_n(&e->key, __ATOMIC_RELAXED) == key) {
+      uint64_t got[OVSET_WORDS];
+      for (int w = 0; w < OVSET_WORDS; w++) got[w] = __atomic_load_n(&e->set[w], __ATOMIC_RELAXED);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) == seq) {
+         for (int w = 0; w < OVSET_WORDS; w++) acc[w] |= got[w];
+         return;
+      }
    }
-   return e->set;
+   uint64_t set[OVSET_WORDS];
+   splitHalfSet(sl, high, u11, set);
+   for (int w = 0; w < OVSET_WORDS; w++) acc[w] |= set[w];
+   uint64_t old = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+   if (!(old & 1) && __atomic_compare_exchange_n(&e->seq, &old, old + 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      __atomic_store_n(&e->key, key, __ATOMIC_RELAXED);
+      for (int w = 0; w < OVSET_WORDS; w++) __atomic_store_n(&e->set[w], set[w], __ATOMIC_RELAXED);
+      __atomic_store_n(&e->seq, old + 2, __ATOMIC_RELEASE);
+   }
 }
 
 static void splitForgetLevel(int level) {
@@ -819,14 +846,8 @@ static int lookAheadSplit(row *pathRows, int candRow, int rowPhase) {
    for (int v = 0; v < 4; v++) {
       if (!((common >> v) & 1)) continue;
       uint64_t unionL[OVSET_WORDS] = {0}, unionH[OVSET_WORDS] = {0};
-      for (int i = offL[v]; i < offL[v + 1]; i++) {
-         const uint64_t *s = splitMemo(sl, 0, rowsL[i]);
-         for (int w = 0; w < OVSET_WORDS; w++) unionL[w] |= s[w];
-      }
-      for (int i = offH[v]; i < offH[v + 1]; i++) {
-         const uint64_t *s = splitMemo(sl, 1, rowsH[i]);
-         for (int w = 0; w < OVSET_WORDS; w++) unionH[w] |= s[w];
-      }
+      for (int i = offL[v]; i < offL[v + 1]; i++) splitMemoOr(sl, 0, rowsL[i], unionL);
+      for (int i = offH[v]; i < offH[v + 1]; i++) splitMemoOr(sl, 1, rowsH[i], unionH);
       uint64_t any = 0;
       for (int w = 0; w < OVSET_WORDS; w++) any |= unionL[w] & unionH[w];
       if (any) return 1;
