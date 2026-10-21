@@ -319,7 +319,7 @@ Measured (single thread, c/5 w12 even, time to the 4th deepening, two rounds): 5
 
 ### 3.13 Membership tests from the half-masks (`useFactoredInner`, widths 4–9)
 
-The idea came from someone else's edit of this program (shared by the user on 20 October 2026), which reported about 14% at c/5 w9.
+The idea came from Katrina, who made her own edit of this program (shared on 20 October 2026); her version reported about 14% at c/5 w9.
 
 **What it does.** In the full lookahead, the innermost test asks, for each row23, whether any row22 is a row reachable from the pair (row13, row23). With per-pair tables that meant opening table (row13, row23), a fresh pair almost every time, just to read its mask. The tables form a pool of hundreds of MB, so that read was usually a cache miss. The factored half-masks (section 4.4) hold exactly the same set (the low and high halves of a row are independent apart from their two overlap bits), take a few hundred kB and stay in cache. Per-pair searches now also build the half-tables and answer that test from them (`factoredBases()` + `factoredHasRowBase()`, the index bases computed once per pair). The candidate lists still come from the per-pair tables, so the search visits rows in the same order.
 
