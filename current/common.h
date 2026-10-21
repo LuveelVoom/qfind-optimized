@@ -698,6 +698,7 @@ uint16_t *tableFor(int row1, int row2) {
 ** ========================================================================== */
 typedef uintptr_t TableRef;
 int useFactored = 0;         /* representation chosen for this search */
+int useFactoredInner = 0;    /* per-pair mode: answer the lookahead's membership-only tests from the half-masks */
 int tableMode = 0;           /* --tables: 0 = auto, 1 = per-pair, 2 = factored */
 #ifndef LOOKAHEAD_BUDGET
 #define LOOKAHEAD_BUDGET 256
@@ -710,6 +711,7 @@ long lookaheadBudget = LOOKAHEAD_BUDGET;   /* --lookahead-budget: work units bef
 #endif
 int splitCacheBits = SPLIT_CACHE_BITS;     /* --split-cache-bits: 2^N shared split-cache entries per half */
 static int lowHalfBits, lowResultBits, highHalfShift, highHalfBits, highResultBits;
+static int lowResultMask;
 static uint8_t *lowHalfRows, *highHalfRows, *lowHalfMasks, *highHalfMasks;
 static uint16_t *lowHalfOffsets, *highHalfOffsets;
 static uint32_t *pairTableRank;
@@ -727,6 +729,26 @@ static inline int factoredHasRow(uint32_t ref, int row4) {
    uint32_t lowPair = ref & 0xFFFF, highPair = ref >> 16;
    return (lowHalfMasks[(lowPair << lowResultBits) | (uint32_t)(row4 & ((1 << lowResultBits) - 1))]
          & highHalfMasks[(highPair << highResultBits) | (uint32_t)(row4 >> lowResultBits)]) != 0;
+}
+/* The same membership test, with the two index bases computed once per pair (row1,row2),
+** so a caller testing many rows against one pair hoists them out of its loop.
+**
+** This is also how the per-pair tables are queried without touching them: the mask of
+** per-pair table (row1,row2) holds exactly the rows reachable from (row1,row2), and the
+** factored half-masks describe the same set (the low and high halves of a row are
+** independent apart from their two overlap bits).  The half-masks take a few hundred kB
+** and stay in cache; the per-pair tables are a pool of hundreds of MB, so a table opened
+** only for membership tests is usually a cache miss.                                    */
+static inline void factoredBases(int row1, int row2, uint32_t *loBase, uint32_t *hiBase) {
+   const int lowMask = (1 << lowHalfBits) - 1;
+   uint32_t lowPair = ((uint32_t)(row1 & lowMask) << lowHalfBits) | (uint32_t)(row2 & lowMask);
+   uint32_t highPair = ((uint32_t)(row1 >> highHalfShift) << highHalfBits) | (uint32_t)(row2 >> highHalfShift);
+   *loBase = lowPair << lowResultBits;
+   *hiBase = highPair << highResultBits;
+}
+static inline int factoredHasRowBase(uint32_t loBase, uint32_t hiBase, int row4) {
+   return (lowHalfMasks[loBase | (uint32_t)(row4 & lowResultMask)]
+         & highHalfMasks[hiBase | (uint32_t)(row4 >> lowResultBits)]) != 0;
 }
 static inline const uint16_t *factoredRows(uint32_t ref, int row4, int *n, uint16_t *buf) {
    uint32_t lowPair = ref & 0xFFFF, highPair = ref >> 16;
@@ -803,6 +825,7 @@ static void buildHalfTable(int isHigh, int halfBits, int resultBits, uint8_t **r
 
 static void buildFactoredTables(void) {
    lowHalfBits = (width >> 1) + 1; lowResultBits = lowHalfBits - 1; highHalfShift = lowHalfBits - 2; highHalfBits = width - highHalfShift; highResultBits = width - lowResultBits;
+   lowResultMask = (1 << lowResultBits) - 1;
    buildHalfTable(0, lowHalfBits, lowResultBits, &lowHalfRows, &lowHalfOffsets, &lowHalfMasks);
    buildHalfTable(1, highHalfBits, highResultBits, &highHalfRows, &highHalfOffsets, &highHalfMasks);
    pairTableRank = (uint32_t*)malloc(sizeof(uint32_t) << width);
@@ -826,6 +849,10 @@ void chooseTableMode(void) {
    else if (lookaheadMethod == 3) useSplitLookahead = 2;
    else useSplitLookahead = (width >= SPLIT_AUTO_WIDTH) ? 1 : 0;
    if (useSplitLookahead && width < 4) useSplitLookahead = 0;
+   /* per-pair mode also builds the half-tables (tiny) for the lookahead's membership-only
+   ** tests; the candidate lists still come from the per-pair tables, so the search order
+   ** is unchanged */
+   useFactoredInner = (width >= 4) ? 1 : 0;
 }
 
 #define PAIR_TABLE_REF(r1, r2)            ((TableRef)tableFor((r1), (r2)))
@@ -924,7 +951,7 @@ void makeTables(void) {
       rowOrder[i] = (uint16_t) ((1<<width)-1-i);
    if (params[P_REORDER] != 0)
       sortRows(rowOrder, 1<<width);
-   if (useFactored || useSplitLookahead)
+   if (useFactored || useSplitLookahead || useFactoredInner)
       buildFactoredTables();
    if (!useFactored)
       for (int row2=0; row2<1<<width; row2++)

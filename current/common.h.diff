@@ -1,5 +1,5 @@
 --- original-2.4b/common.h	2026-10-17 11:16:42
-+++ current/common.h	2026-10-17 15:36:05
++++ current/common.h	2026-10-20 20:27:17
 @@ -4,12 +4,18 @@
  ** determined by the presence of the macro QSIMPLE defined in qfind-s.c.
  */
@@ -451,7 +451,7 @@
           theRow[j+1] = theRow[j];
           --j;
        }
-@@ -487,45 +544,338 @@
+@@ -487,45 +544,365 @@
     }
  }
  
@@ -629,6 +629,7 @@
 +** ========================================================================== */
 +typedef uintptr_t TableRef;
 +int useFactored = 0;         /* representation chosen for this search */
++int useFactoredInner = 0;    /* per-pair mode: answer the lookahead's membership-only tests from the half-masks */
 +int tableMode = 0;           /* --tables: 0 = auto, 1 = per-pair, 2 = factored */
 +#ifndef LOOKAHEAD_BUDGET
 +#define LOOKAHEAD_BUDGET 256
@@ -641,6 +642,7 @@
 +#endif
 +int splitCacheBits = SPLIT_CACHE_BITS;     /* --split-cache-bits: 2^N shared split-cache entries per half */
 +static int lowHalfBits, lowResultBits, highHalfShift, highHalfBits, highResultBits;
++static int lowResultMask;
 +static uint8_t *lowHalfRows, *highHalfRows, *lowHalfMasks, *highHalfMasks;
 +static uint16_t *lowHalfOffsets, *highHalfOffsets;
 +static uint32_t *pairTableRank;
@@ -658,6 +660,26 @@
 +   uint32_t lowPair = ref & 0xFFFF, highPair = ref >> 16;
 +   return (lowHalfMasks[(lowPair << lowResultBits) | (uint32_t)(row4 & ((1 << lowResultBits) - 1))]
 +         & highHalfMasks[(highPair << highResultBits) | (uint32_t)(row4 >> lowResultBits)]) != 0;
++}
++/* The same membership test, with the two index bases computed once per pair (row1,row2),
++** so a caller testing many rows against one pair hoists them out of its loop.
++**
++** This is also how the per-pair tables are queried without touching them: the mask of
++** per-pair table (row1,row2) holds exactly the rows reachable from (row1,row2), and the
++** factored half-masks describe the same set (the low and high halves of a row are
++** independent apart from their two overlap bits).  The half-masks take a few hundred kB
++** and stay in cache; the per-pair tables are a pool of hundreds of MB, so a table opened
++** only for membership tests is usually a cache miss.                                    */
++static inline void factoredBases(int row1, int row2, uint32_t *loBase, uint32_t *hiBase) {
++   const int lowMask = (1 << lowHalfBits) - 1;
++   uint32_t lowPair = ((uint32_t)(row1 & lowMask) << lowHalfBits) | (uint32_t)(row2 & lowMask);
++   uint32_t highPair = ((uint32_t)(row1 >> highHalfShift) << highHalfBits) | (uint32_t)(row2 >> highHalfShift);
++   *loBase = lowPair << lowResultBits;
++   *hiBase = highPair << highResultBits;
++}
++static inline int factoredHasRowBase(uint32_t loBase, uint32_t hiBase, int row4) {
++   return (lowHalfMasks[loBase | (uint32_t)(row4 & lowResultMask)]
++         & highHalfMasks[hiBase | (uint32_t)(row4 >> lowResultBits)]) != 0;
 +}
 +static inline const uint16_t *factoredRows(uint32_t ref, int row4, int *n, uint16_t *buf) {
 +   uint32_t lowPair = ref & 0xFFFF, highPair = ref >> 16;
@@ -738,6 +760,7 @@
  
 +static void buildFactoredTables(void) {
 +   lowHalfBits = (width >> 1) + 1; lowResultBits = lowHalfBits - 1; highHalfShift = lowHalfBits - 2; highHalfBits = width - highHalfShift; highResultBits = width - lowResultBits;
++   lowResultMask = (1 << lowResultBits) - 1;
 +   buildHalfTable(0, lowHalfBits, lowResultBits, &lowHalfRows, &lowHalfOffsets, &lowHalfMasks);
 +   buildHalfTable(1, highHalfBits, highResultBits, &highHalfRows, &highHalfOffsets, &highHalfMasks);
 +   pairTableRank = (uint32_t*)malloc(sizeof(uint32_t) << width);
@@ -761,6 +784,10 @@
 +   else if (lookaheadMethod == 3) useSplitLookahead = 2;
 +   else useSplitLookahead = (width >= SPLIT_AUTO_WIDTH) ? 1 : 0;
 +   if (useSplitLookahead && width < 4) useSplitLookahead = 0;
++   /* per-pair mode also builds the half-tables (tiny) for the lookahead's membership-only
++   ** tests; the candidate lists still come from the per-pair tables, so the search order
++   ** is unchanged */
++   useFactoredInner = (width >= 4) ? 1 : 0;
 +}
 +
 +#define PAIR_TABLE_REF(r1, r2)            ((TableRef)tableFor((r1), (r2)))
@@ -818,7 +845,7 @@
  void genStatCounts(void);
  
  void makeFlip(void) {
-@@ -536,84 +886,162 @@
+@@ -536,84 +913,162 @@
  		for (i = 0; i < width; i++)
  			if (theRow & (1<<i))
  				flippedRow |= 1 << (width - i - 1);
@@ -879,7 +906,7 @@
 -   for (int row2=0; row2<1<<width; row2++)
 -      makeRow(0, row2);
 +      sortRows(rowOrder, 1<<width);
-+   if (useFactored || useSplitLookahead)
++   if (useFactored || useSplitLookahead || useFactoredInner)
 +      buildFactoredTables();
 +   if (!useFactored)
 +      for (int row2=0; row2<1<<width; row2++)
@@ -1026,7 +1053,7 @@
     
     /* For each row3, find all row4 such that   *\
     **                                          **
-@@ -621,77 +1049,131 @@
+@@ -621,77 +1076,131 @@
     **      row2 ----------------> row4         **
     **      row3                                **
     **                                          **
@@ -1208,7 +1235,7 @@
  }
  
  /*   We calculate the stats using a 2 * 64 << width array.  We use a
-@@ -701,7 +1183,9 @@
+@@ -701,7 +1210,9 @@
  **   the edge conditions appropriately.
  */
  void genStatCounts(void) {
@@ -1219,7 +1246,7 @@
     for (int i=0; i<128<<width; i++)
        cnt[i] = 0;
     int s = 0;
-@@ -734,14 +1218,14 @@
+@@ -734,14 +1245,14 @@
                         ((row1 >> 1) << 4) + ((row2 >> 1) << 2) + (row3 >> 1)];
              }
     }
@@ -1236,7 +1263,7 @@
                       cnt[(((1<<width) + row4) << 6) +
                         (row1 << 4) + (row2 << 2) + row3];
     free(cnt);
-@@ -752,27 +1236,29 @@
+@@ -752,27 +1263,29 @@
  /* ====================================================== */
  
  void resetHash(void) {
@@ -1276,7 +1303,7 @@
     int i;
     for (i = 0; i < nRowsInState; i++) {
        if (p >= QSIZE || q >= QSIZE || EMPTY(p) || EMPTY(q)) return 0;   /* sanity check */
-@@ -784,11 +1270,11 @@
+@@ -784,11 +1297,11 @@
     return 1;
  }
  
@@ -1290,7 +1317,7 @@
        p = PARENT(p);
        r = ROW(q);
        q = PARENT(q);
-@@ -798,15 +1284,15 @@
+@@ -798,15 +1311,15 @@
  
  /* test if we've seen this child before */
  static inline int isVisited(node b, row r) {
@@ -1312,7 +1339,7 @@
           return 1;
     }
     return 0;
-@@ -814,7 +1300,7 @@
+@@ -814,7 +1327,7 @@
  
  /* Add node (NOT child) to hash table */
  static inline void setVisited(node b) {
@@ -1321,7 +1348,7 @@
  }
  
  /* ============================================== */
-@@ -854,7 +1340,7 @@
+@@ -854,7 +1367,7 @@
           bufRLE(r & 1 ? 'o' : 'b');
        else shift--;
        r >>= 1;
@@ -1330,7 +1357,7 @@
        rr >>= 1;
     }
     bufRLE('$');
-@@ -868,28 +1354,28 @@
+@@ -868,28 +1381,28 @@
      return (rr>>i);
  }
  
@@ -1372,7 +1399,7 @@
           if (currRow == 0){
              if (!printExpected) return 0;
              printf("Success called on search root!\n");
-@@ -906,7 +1392,7 @@
+@@ -906,7 +1419,7 @@
           b = PARENT(b);
        }
        currRow = currRow - period + 1;
@@ -1381,7 +1408,7 @@
        
     }
     else{
-@@ -922,7 +1408,7 @@
+@@ -922,7 +1435,7 @@
           }
        }
     }
@@ -1390,7 +1417,7 @@
     
     for (p = 0; p < period-1; p++) b = PARENT(b);
     if (b == 0) {
-@@ -937,34 +1423,34 @@
+@@ -937,34 +1450,34 @@
     while (c != 0) {
        for (p = 0; p < period; p++)
           c = PARENT(c);
@@ -1443,7 +1470,7 @@
           currRow -= period;
           nDeepRows--;
        }
-@@ -976,31 +1462,31 @@
+@@ -976,31 +1489,31 @@
        }
        switch(params[P_SYMMETRY]) {
           case SYM_ASYM:
@@ -1485,7 +1512,7 @@
              break;
  
           default:
-@@ -1010,18 +1496,18 @@
+@@ -1010,18 +1523,18 @@
     }
     
     /* normalize nrows to only include blank rows */
@@ -1512,7 +1539,7 @@
           allEmpty = 0;
           break;
        }
-@@ -1034,26 +1520,26 @@
+@@ -1034,26 +1547,26 @@
     
     /* make at least one row have nonzero first bit */
     i = 0;
@@ -1554,7 +1581,7 @@
     
        
     /* compute margin on other side of width */
-@@ -1061,29 +1547,29 @@
+@@ -1061,29 +1574,29 @@
  
     /* make sure we didn't just output the exact same pattern */
     if (printExpected){
@@ -1596,7 +1623,7 @@
     }
     RLEcount = 1;     /* prevents erroneous printing of '2' at end of RLE */
     RLEchar = '!';
-@@ -1102,14 +1588,14 @@
+@@ -1102,14 +1615,14 @@
  
  #ifndef QSIMPLE
  void makeSubperiodTables(void);
@@ -1615,7 +1642,7 @@
        printf("\n%s\n",patternBuf);
     fflush(stdout);
  }
-@@ -1140,13 +1626,13 @@
+@@ -1140,13 +1653,13 @@
  node qStart; /* index of first node in queue */
  node qEnd;   /* index of first unused node after end of queue */
  
@@ -1636,7 +1663,7 @@
  */
  int queuePhase = 0;
  node nextRephase = 0;
-@@ -1182,7 +1668,7 @@
+@@ -1182,7 +1695,7 @@
  static inline int qIsEmpty(void) {
     while (qHead < qTail && EMPTY(qHead)){
        ++qHead;
@@ -1645,7 +1672,7 @@
     }
     return (qTail == qHead);
  }
-@@ -1196,42 +1682,46 @@
+@@ -1196,42 +1709,46 @@
  }
  
  static inline void enqueue(node b, row r) {
@@ -1709,7 +1736,7 @@
     return qHead++;
  }
  
-@@ -1242,7 +1732,7 @@
+@@ -1242,7 +1759,7 @@
  }
  
  void resetQ(void) {
@@ -1718,7 +1745,7 @@
  }
  
  //static inline int qTop() { return qTail - 1; }
-@@ -1271,33 +1761,35 @@
+@@ -1271,33 +1788,35 @@
  #define D_SEQUENTIAL (2)
  
  void parseDumpRoot(void) {
@@ -1765,7 +1792,7 @@
        if (*r == '@')
           *r = '_';
     
-@@ -1351,19 +1843,19 @@
+@@ -1351,19 +1870,19 @@
     fprintf(fp,"%"PRIu32"\n",qHead-qStart);
     fprintf(fp,"%"PRIu32"\n",qEnd-qStart);
     for (i = qStart; i < qEnd; ++i)
@@ -1792,7 +1819,7 @@
                 ++i;
              }
              fprintf(fp,"%llu\n",j);
-@@ -1380,7 +1872,7 @@
+@@ -1380,7 +1899,7 @@
  /*  Compaction of nearly full queue  */
  /* ================================= */
  
@@ -1801,7 +1828,7 @@
     char suffix;
     if (n >= 1000000) {
        n /= 100000;
-@@ -1428,7 +1920,7 @@
+@@ -1428,7 +1947,7 @@
                       x is nonempty and points to y or something before y.
                       so, if x doesn't point to y, y must be unused and can be removed. */
        if (!EMPTY(y)) {
@@ -1810,7 +1837,7 @@
           else while (EMPTY(x) || PARENT(x) == y) x--;
        }
        y--;
-@@ -1438,10 +1930,10 @@
+@@ -1438,10 +1957,10 @@
     /* note that after unused nodes are eliminated, all these offsets are zero or one. */
     y = 0;
     for (x = 0; x < qTail; x++) if (!EMPTY(x)) {
@@ -1823,7 +1850,7 @@
        }
     }
     
-@@ -1460,7 +1952,7 @@
+@@ -1460,7 +1979,7 @@
     for (;;) {
        if (qHead == y) qHead = x;
        if (!EMPTY(y)) {
@@ -1832,7 +1859,7 @@
           x--;
        }
        if (y-- == 0) break;    /* circumlocution for while (y >= 0) because x is unsigned */
-@@ -1483,7 +1975,7 @@
+@@ -1483,7 +2002,7 @@
     qTail = 0; y = 0;
     resetHash();
     for (x = qStart; x < qEnd; x++) {
@@ -1841,7 +1868,7 @@
           y++;
           while (EMPTY(y)) y++;
        }
-@@ -1497,15 +1989,15 @@
+@@ -1497,15 +2016,15 @@
     /* Repack nonzero depth-first extension indices to the end of the queue */
     j = QSIZE - 1;
     for (i = QSIZE; i > 0; --i){
@@ -1861,7 +1888,7 @@
        fprintf(stderr,"Error: extension queue has too many elements.\n");
        exit(1);
     }
-@@ -1513,39 +2005,39 @@
+@@ -1513,39 +2032,39 @@
     /* Respace depth-first extension queue to match node queue */
     i = 0;
     j = 0;
@@ -1913,7 +1940,7 @@
  }
  
  void doCompact(void) {
-@@ -1568,30 +2060,31 @@
+@@ -1568,30 +2087,31 @@
  /* ================= */
  
  #ifndef NOCACHE
@@ -1961,7 +1988,7 @@
  }
  #endif
  
-@@ -1600,9 +2093,12 @@
+@@ -1600,9 +2120,12 @@
  /* ========================== */
  
  void process(node theNode);
@@ -1975,7 +2002,7 @@
     /* compute amount to deepen, apply reduction if too deep */
     int deepeningAmount;
     int i = currentDepth();
-@@ -1619,9 +2115,9 @@
+@@ -1619,9 +2142,9 @@
     
     /* report what's happening */
     printf("%d, deepening %d, ", i, deepeningAmount);
@@ -1987,7 +2014,7 @@
     fflush(stdout);
     
     _Atomic int remainingItems = 0;
-@@ -1634,24 +2130,28 @@
+@@ -1634,24 +2157,28 @@
     /* go through queue, deepening each one */
     #pragma omp parallel
     {
@@ -2026,7 +2053,7 @@
     }
     
     /* before reporting new queue size, shrink tree back down */
-@@ -1667,9 +2167,10 @@
+@@ -1667,9 +2194,10 @@
     doCompact();
     
     /* now finish report */
@@ -2039,7 +2066,7 @@
     printf("\n");
     
     /* Report successful/unsuccessful dump */
-@@ -1705,37 +2206,37 @@
+@@ -1705,37 +2233,37 @@
           deepen();
        }
        else
@@ -2092,7 +2119,7 @@
  }
  
  /* ========================== */
-@@ -1793,12 +2294,41 @@
+@@ -1793,12 +2321,41 @@
            "                                enable/disable early exit during deepening step\n"
            "                                when threads become idle (default: enabled)\n");
  #endif
@@ -2138,7 +2165,7 @@
     printf("  -m, --mem-limit <number>      limits lookup table memory to N megabytes\n");
     printf("  -q, --queue-bits <number>     set BFS queue size to 2^N nodes (default: %d)\n", QBITS);
     printf("  -h, --hash-bits <number>      set hash table size to 2^N nodes (default: %d)\n"
-@@ -1831,7 +2361,29 @@
+@@ -1831,7 +2388,29 @@
     printf("\n");
     printf("Documentation options:\n");
     printf("  --help                        print usage instructions and exit\n");
@@ -2168,7 +2195,7 @@
     printf("\n");
     printf("Example search:\n"
            "    ./qfind -v c/5 -w 9 -s even -r B3/S23 -t 2\n\n"
-@@ -1891,6 +2443,10 @@
+@@ -1891,6 +2470,10 @@
  #endif
     if (params[P_MINEXTENSION]) printf("Save depth-first extensions of length at least %d\n",params[P_MINEXTENSION]);
     if (params[P_LONGEST] == 0) printf("Printing of longest partial result disabled\n");
@@ -2179,7 +2206,7 @@
     printf("\n");
  }
  
-@@ -1900,7 +2456,7 @@
+@@ -1900,7 +2483,7 @@
  
  static void preview(void /*int allPhases*/) {
     node i,j;
@@ -2188,7 +2215,7 @@
     // int ph;  /* used for allPhases option */
     // node k;  /* used for allPhases option */
  
-@@ -1910,25 +2466,25 @@
+@@ -1910,25 +2493,25 @@
     
     while (j>=i && !aborting) {
        if (!EMPTY(j)) {
@@ -2226,7 +2253,7 @@
           }
           else{
              success(j, NULL, 0, 0);
-@@ -1964,34 +2520,34 @@
+@@ -1964,34 +2547,34 @@
     optError(errorMsg,"");
  }
  
@@ -2271,7 +2298,7 @@
                    return 2;
              }
           }
-@@ -1999,18 +2555,18 @@
+@@ -1999,18 +2582,18 @@
        else if (*p == '-'){
           p++;
           for (i = 0; i < 256; i++)
@@ -2296,7 +2323,7 @@
                    return 2;
              }
           }
-@@ -2018,10 +2574,10 @@
+@@ -2018,10 +2601,10 @@
        else {
           for (; *p != '\0' && !('0' <= *p && *p <= '8'); p++){
              for (i = 0; i < 256; i++){
@@ -2310,7 +2337,7 @@
                       return 2;
                 }
              }
-@@ -2120,7 +2676,7 @@
+@@ -2120,7 +2703,7 @@
  void checkGutter(void) {
     int i = 0;
     /* if there are forbidden birth conditions, i will be less than 256 */
@@ -2319,7 +2346,7 @@
        i++;
     
     if (checkConditions("B2ci4ci6i") <= 0)
-@@ -2145,7 +2701,7 @@
+@@ -2145,7 +2728,7 @@
     
     /* Errors */
     
@@ -2328,7 +2355,7 @@
     
     if (ruleError != 0){
        optError("failed to parse rule ", rule);
-@@ -2183,8 +2739,14 @@
+@@ -2183,8 +2766,14 @@
        printError("initial rows file cannot be used when the search state is loaded from a\n       "
                   "saved state.");
     }
@@ -2345,7 +2372,7 @@
     if (params[P_BASEBITS] <= 0)
        printError("base bits (-b) must be positive.");
     if (params[P_BASEBITS] >= params[P_QBITS])
-@@ -2196,16 +2758,13 @@
+@@ -2196,15 +2785,12 @@
     if (2 * params[P_OFFSET] > params[P_PERIOD] && params[P_PERIOD] > 0){
        fprintf(stderr, "Warning: searches for speeds exceeding c/2 may not work correctly.\n");
     }
@@ -2353,6 +2380,11 @@
 -   if (5 * params[P_OFFSET] > params[P_PERIOD] && params[P_PERIOD] > 0 && params[P_CACHEMEM] == 0){
 -      fprintf(stderr, "Warning: Searches for speeds exceeding c/5 may be slower without caching.\n"
 -                      "         It is recommended that you increase the cache memory (-c).\n");
+-   }
+-#else
+-   if (5 * params[P_OFFSET] <= params[P_PERIOD] && params[P_OFFSET] > 0 && params[P_CACHEMEM] > 0){
+-      fprintf(stderr, "Warning: Searches for speeds at or below c/5 may be slower with caching.\n"
+-                      "         It is recommended that you disable caching (-c 0).\n");
 +#ifndef NOCACHE
 +   if (params[P_CACHEMEM] > 0){
 +      fprintf(stderr, "Note: lookahead caching (-c) uses the original lookahead, which measured\n"
@@ -2360,15 +2392,9 @@
 +      if (lookaheadDepth != 3)
 +         fprintf(stderr, "Warning: --lookahead-depth is ignored while lookahead caching is enabled.\n");
     }
--#else
--   if (5 * params[P_OFFSET] <= params[P_PERIOD] && params[P_OFFSET] > 0 && params[P_CACHEMEM] > 0){
--      fprintf(stderr, "Warning: Searches for speeds at or below c/5 may be slower with caching.\n"
--                      "         It is recommended that you disable caching (-c 0).\n");
--   }
  #endif
     if (params[P_SYMMETRY] == SYM_ASYM && params[P_BOUNDARYSYM] != SYM_UNDEF){
-       fprintf(stderr, "Warning: the wave symmetry settings are equivalent to a spaceship search.\n");
-@@ -2216,8 +2775,8 @@
+@@ -2216,8 +2802,8 @@
     if (params[P_QBITS] > 31 && !aborting){
        fprintf(stderr, "Warning: queue bits (-q) reduced to 31.\n");
        params[P_QBITS] = 31;      /* corresponds to a queue size of 2GB */
@@ -2379,7 +2405,7 @@
           params[P_BASEBITS] = 30;
        }
     }
-@@ -2309,17 +2868,17 @@
+@@ -2309,17 +2895,17 @@
     params[P_DEPTHLIMIT] = DEFAULT_DEPTHLIMIT;
     
      /* Allocate space for the data structures */
@@ -2403,7 +2429,7 @@
     }
     
     /* Load up BFS queue */
-@@ -2328,44 +2887,46 @@
+@@ -2328,44 +2914,46 @@
     qStart = QSIZE - qEnd;
     qEnd   = QSIZE;
     qHead += qStart;
@@ -2465,7 +2491,7 @@
     makeFlip();
     
     /* complete compaction */
-@@ -2390,7 +2951,7 @@
+@@ -2390,7 +2978,7 @@
  void loadInitRows(char * file) {
     FILE * fp;
     int i,j;
@@ -2474,7 +2500,7 @@
     row theRow = 0;
     
     loadFile = file;
-@@ -2400,7 +2961,7 @@
+@@ -2400,7 +2988,7 @@
     printf("Starting search from rows in %s:\n",loadFile);
     
     for (i = 0; i < 2 * period; i++){
@@ -2483,7 +2509,7 @@
        for (j = 0; j < width; j++){
           theRow |= ((rowStr[width - j - 1] == '.') ? 0:1) << j;
        }
-@@ -2430,12 +2991,12 @@
+@@ -2430,12 +3018,12 @@
     params[P_BASEBITS] = 4;
     params[P_QBITS] = QBITS;
     params[P_HASHBITS] = HASHBITS;
@@ -2498,7 +2524,7 @@
     params[P_MEMLIMIT] = -1;   /* negative value means no limit */
     params[P_PRINTDEEP] = 1;
     params[P_LONGEST] = 1;
-@@ -2579,7 +3140,7 @@
+@@ -2579,7 +3167,7 @@
           if (*off == 0){
              *off = xoff;
              xoff = 0;
@@ -2507,7 +2533,7 @@
           }
           else if (xoff == *off || xoff * (-1) == *off)
              return "diagonal spaceship searches are not supported.";
-@@ -2658,6 +3219,11 @@
+@@ -2658,6 +3246,11 @@
        {"enable-early-exit",   no_argument,       265},
        {"disable-early-exit",  no_argument,       266},
  #endif
@@ -2519,7 +2545,7 @@
        {0, 0, 0}   /* marks end of long options list */
     };
     
-@@ -2843,6 +3409,34 @@
+@@ -2843,6 +3436,34 @@
           case 265:   /* --enable-early-exit */
              params[P_EARLYEXIT] = 1;
              break;
@@ -2554,7 +2580,7 @@
           case 266:   /* --disable-early-exit */
              params[P_EARLYEXIT] = 0;
              break;
-@@ -2884,27 +3478,26 @@
+@@ -2884,27 +3505,26 @@
        width = params[P_WIDTH];
        period = params[P_PERIOD];
        offset = params[P_OFFSET];
@@ -2590,7 +2616,7 @@
        
        resetQ();
        resetHash();
-@@ -2993,17 +3586,17 @@
+@@ -2993,17 +3613,17 @@
        node fixedQTail = qTail;
        
        /* delete the queue; we will reload it as needed */
@@ -2615,7 +2641,7 @@
        
        node currNode = fixedQHead;
        
-@@ -3015,10 +3608,10 @@
+@@ -3015,10 +3635,10 @@
           loadState();
           
           /* empty everything before currNode */
@@ -2628,7 +2654,7 @@
              ++j;
           }
           
-@@ -3037,7 +3630,7 @@
+@@ -3037,7 +3657,7 @@
           /* empty everything after specified nonempty nodes */
           while (x < fixedQTail){
              MAKEEMPTY(x);
@@ -2637,7 +2663,7 @@
              ++x;
              ++j;
           }
-@@ -3061,15 +3654,15 @@
+@@ -3061,15 +3681,15 @@
           
           /* free memory allocated in loadState() */
           for (deepIndex = 0; deepIndex < 1LLU << (params[P_DEPTHLIMIT] + 1); ++deepIndex){
@@ -2660,7 +2686,7 @@
        }
        
        printf("Saved pieces in files %s%05d to %s\n",dumpRoot,firstDumpNum,dumpFile);
-@@ -3078,7 +3671,7 @@
+@@ -3078,7 +3698,7 @@
     
     omp_set_num_threads(params[P_NUMTHREADS]);
     
@@ -2669,7 +2695,7 @@
     
     /* Allocate lookahead cache */
  #ifndef NOCACHE
-@@ -3092,15 +3685,16 @@
+@@ -3092,15 +3712,16 @@
     }
     totalCache = (cacheentry *)calloc((size_t) ((cachesize + 5) * params[P_NUMTHREADS]), 
                                       sizeof(cacheentry));
@@ -2688,7 +2714,7 @@
     makeTables();
     
     rephase();
-@@ -3114,6 +3708,7 @@
+@@ -3114,6 +3735,7 @@
  void finalReport(void) {
     timeStamp();
     printf("Search complete.\n\n");

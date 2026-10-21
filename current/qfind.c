@@ -273,10 +273,15 @@ static int lookAheadReference(row *pathRows, int candRow, int rowPhase){
             
             for (i23 = 0; i23 < len23; ++i23){
                row23 = list23[i23];
-               TableRef table33 = TABLE_REF(useFactored, row13, row23);
+               /* per-pair tables: answer from the half-masks (the same set, but cache-resident),
+               ** so this (row13,row23) table, opened only for these tests, is never touched */
+               const int half = useFactoredInner && !useFactored;
+               TableRef table33 = half ? 0 : TABLE_REF(useFactored, row13, row23);
+               uint32_t lo33 = 0, hi33 = 0;
+               if (half) factoredBases(row13, row23, &lo33, &hi33);
                for (i22 = 0; i22 < len22; ++i22){
                   row22 = list22[i22];
-                  if (TABLE_HAS_ROW(useFactored, table33, row22)) {
+                  if (half ? factoredHasRowBase(lo33, hi33, row22) : TABLE_HAS_ROW(useFactored, table33, row22)) {
 #ifndef NOCACHE
                      cacheStore(cacheSlot, 1);
 #endif
@@ -358,7 +363,7 @@ static void laForgetAll(void) {
    splitForgetAll();
 }
 
-static void laBuildStage0(LookaheadLevel *lvl, const row *pathRows, int candRow, int rowPhase) {
+static inline __attribute__((always_inline)) void laBuildStage0(LookaheadLevel *lvl, const row *pathRows, int candRow, int rowPhase, const int factored) {
    (void)rowPhase;
    const int f = FWDOFF(rowPhase), d = DOUBLEOFF(rowPhase), t = TRIPLEOFF(rowPhase);
    lvl->row13Known = (t >= PERIOD);
@@ -366,18 +371,18 @@ static void laBuildStage0(LookaheadLevel *lvl, const row *pathRows, int candRow,
    lvl->rowB1 = pathRows[candRow - PERIOD - d]; lvl->rowB2 = pathRows[candRow - d];
    lvl->rowC2 = pathRows[candRow - t];
    lvl->rowC1 = lvl->row13Known ? pathRows[candRow + PERIOD - t] : pathRows[candRow - PERIOD - t];
-   lvl->table11 = TABLE_REF(useFactored, lvl->rowA1, lvl->rowA2);
+   lvl->table11 = TABLE_REF(factored, lvl->rowA1, lvl->rowA2);
    lvl->built0 = 1;
 }
 
-static void laBuildStage1(LookaheadLevel *lvl) {
+static inline __attribute__((always_inline)) void laBuildStage1(LookaheadLevel *lvl, const int factored) {
    if (!lvl->decode12) {
       lvl->decode12 = (uint16_t*)malloc(DECODE_CAP * sizeof(uint16_t));
       lvl->decode13 = (uint16_t*)malloc(DECODE_CAP * sizeof(uint16_t));
    }
-   lvl->list12 = TABLE_ROWS(useFactored, TABLE_REF(useFactored, lvl->rowB1, lvl->rowB2), lvl->rowA2, &lvl->len12, lvl->decode12);
+   lvl->list12 = TABLE_ROWS(factored, TABLE_REF(factored, lvl->rowB1, lvl->rowB2), lvl->rowA2, &lvl->len12, lvl->decode12);
    if (lvl->row13Known) { lvl->only13 = (uint16_t)lvl->rowC1; lvl->list13 = &lvl->only13; lvl->len13 = 1; }
-   else lvl->list13 = TABLE_ROWS(useFactored, TABLE_REF(useFactored, lvl->rowC1, lvl->rowC2), lvl->rowB2, &lvl->len13, lvl->decode13);
+   else lvl->list13 = TABLE_ROWS(factored, TABLE_REF(factored, lvl->rowC1, lvl->rowC2), lvl->rowB2, &lvl->len13, lvl->decode13);
    if (lvl->len12 > lvl->cap12) {
       lvl->cap12 = 2 * lvl->len12;
       lvl->tables22 = (TableRef*)realloc((void*)lvl->tables22, lvl->cap12 * sizeof(*lvl->tables22));
@@ -498,7 +503,12 @@ static int factoredInner(uint32_t ref22, int row11, uint32_t ref23, int row12, i
    return 0;
 }
 #endif
-static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, int candRow, int rowPhase, const int factored){
+/* Compiled once per combination of two compile-time choices:
+**   factored: the lists come from the factored half-tables (1) or the per-pair tables (0);
+**   half:     the innermost (row33) test uses the factored half-masks (1) or the
+**             per-pair table's mask (0).  The (row13,row23) table is opened only for
+**             that test, so with the half-masks it is never touched.                  */
+static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, int candRow, int rowPhase, const int factored, const int half){
 #ifndef QSIMPLE
    /* list13 would depend on the candidate itself; use the reference code for that case. */
    if (TRIPLEOFF(rowPhase) == PERIOD) return lookAheadReference(pathRows, candRow, rowPhase);
@@ -506,7 +516,7 @@ static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, i
    return lookAheadReference(pathRows, candRow, rowPhase);
 #endif
    LookaheadLevel *lvl = laGetLevel(candRow);
-   if (__builtin_expect(!lvl->built0, 0)) laBuildStage0(lvl, pathRows, candRow, rowPhase);
+   if (__builtin_expect(!lvl->built0, 0)) laBuildStage0(lvl, pathRows, candRow, rowPhase, factored);
    
    /* stage 0: does the candidate have any row11 at all? */
    TableRef table11 = lvl->table11;
@@ -520,7 +530,7 @@ static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, i
    int len11;
    const uint16_t *list11 = TABLE_ROWS(factored, table11, cand, &len11, laDecode11);
    
-   if (!lvl->built1) laBuildStage1(lvl);
+   if (!lvl->built1) laBuildStage1(lvl, factored);
    
    if (len11 > laLists22Cap) {
       laLists22Cap = 2 * len11;
@@ -529,6 +539,7 @@ static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, i
    }
    const uint16_t **lists22 = laLists22;
    int *lens22 = laLens22;
+   const int depth = lookaheadDepth;   /* the global is read once, not per iteration */
    long work = 0;
    const long budget = laBudget;
 #ifdef INNER_SPLIT
@@ -559,6 +570,17 @@ static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, i
    }
 #endif
    
+   /* The mask of a per-pair table is a cold cache line, and the loop below reads the
+   ** masks of all the row12 tables in turn.  Resolving those tables and prefetching
+   ** them first lets the misses overlap instead of stalling once per row12. */
+   if (!factored) {
+      for (int i12 = 0; i12 < lvl->len12; ++i12) {
+         TableRef t = lvl->tables22[i12];
+         if (!t) t = lvl->tables22[i12] = TABLE_REF(factored, lvl->rowB2, lvl->list12[i12]);
+         __builtin_prefetch((const void *)t);
+      }
+   }
+   
    for (int i12 = 0; i12 < lvl->len12; ++i12) {
       const int row12 = lvl->list12[i12];
       TableRef table22 = lvl->tables22[i12];
@@ -578,7 +600,7 @@ static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, i
       }
       work += len11;
       if (!numLists) continue;
-      if (lookaheadDepth == 1) return 1;     /* --lookahead-depth 1: some row11, row12, row22 exist */
+      if (depth == 1) return 1;     /* --lookahead-depth 1: some row11, row12, row22 exist */
       
       for (int i13 = 0; i13 < lvl->len13; ++i13) {
          const int row13 = lvl->list13[i13];
@@ -587,12 +609,21 @@ static inline __attribute__((always_inline)) int lookAheadFastT(row *pathRows, i
          if (!TABLE_HAS_ROW(factored, table23, row12)) continue;
          int len23;
          const uint16_t *list23 = TABLE_ROWS(factored, table23, row12, &len23, laDecode23);
-         if (lookaheadDepth == 2 && len23) return 1;   /* --lookahead-depth 2: row13, row23 also exist */
+         if (depth == 2 && len23) return 1;   /* --lookahead-depth 2: row13, row23 also exist */
          for (int k = 0; k < len23; ++k) {
-            TableRef table33 = TABLE_REF(factored, row13, list23[k]);
-            for (int s = 0; s < numLists; ++s)
-               for (int e = 0; e < lens22[s]; ++e)
-                  if (TABLE_HAS_ROW(factored, table33, lists22[s][e])) return 1;   /* some row33 exists */
+            if (half) {   /* same set as table (row13,row23)'s mask, from the cache-resident half-masks */
+               uint32_t loBase, hiBase;
+               factoredBases(row13, list23[k], &loBase, &hiBase);
+               for (int s = 0; s < numLists; ++s)
+                  for (int e = 0; e < lens22[s]; ++e)
+                     if (factoredHasRowBase(loBase, hiBase, lists22[s][e])) return 1;   /* some row33 exists */
+            }
+            else {
+               TableRef table33 = TABLE_REF(factored, row13, list23[k]);
+               for (int s = 0; s < numLists; ++s)
+                  for (int e = 0; e < lens22[s]; ++e)
+                     if (TABLE_HAS_ROW(factored, table33, lists22[s][e])) return 1;   /* some row33 exists */
+            }
             work += used;
             if (budget >= 0 && work > budget) return -1;   /* too expensive: let the split lookahead answer */
          }
@@ -871,10 +902,13 @@ static int lookAheadSplit(row *pathRows, int candRow, int rowPhase) {
    return 0;
 }
 
-static int lookAheadFastPair(row *pathRows, int candRow, int rowPhase) { return lookAheadFastT(pathRows, candRow, rowPhase, 0); }
-static int lookAheadFastFactored(row *pathRows, int candRow, int rowPhase) { return lookAheadFastT(pathRows, candRow, rowPhase, 1); }
+static int lookAheadFastPair(row *pathRows, int candRow, int rowPhase) { return lookAheadFastT(pathRows, candRow, rowPhase, 0, 0); }
+static int lookAheadFastPairHalf(row *pathRows, int candRow, int rowPhase) { return lookAheadFastT(pathRows, candRow, rowPhase, 0, 1); }
+static int lookAheadFastFactored(row *pathRows, int candRow, int rowPhase) { return lookAheadFastT(pathRows, candRow, rowPhase, 1, 1); }
 static inline int lookAheadFast(row *pathRows, int candRow, int rowPhase) {
-   return useFactored ? lookAheadFastFactored(pathRows, candRow, rowPhase) : lookAheadFastPair(pathRows, candRow, rowPhase);
+   if (useFactored) return lookAheadFastFactored(pathRows, candRow, rowPhase);
+   return useFactoredInner ? lookAheadFastPairHalf(pathRows, candRow, rowPhase)
+                           : lookAheadFastPair(pathRows, candRow, rowPhase);
 }
 
 /* full-depth lookahead with the method chosen for this search (cone, split or hybrid) */

@@ -24,6 +24,7 @@ This document explains every change made to `qfind.c` and `common.h` relative to
 | Table memory growth (width ≥ 10) | **factored tables**: growth per extra width drops from about 7× to about 2.8×. Width 10: 1.48 GB → 6 MB; widths 11–12 now run in 16–26 MB where the old layout ran out of memory (section 4.4) [measured] | exhaustive; identical search when lists are sorted (`-DFACTORED_SORTED`) [verified] |
 | Lookahead cost growth (width ≥ 12) | **split lookahead**: each lookahead test is solved on half rows joined on their 2 overlap bits, so its cost no longer grows with width. Equal-work time vs the previous lookahead: 2.5× slower at widths 7–8, about even at 12, 2.4× faster at 13 (first deepening). Used automatically from width 12 (section 3.7) [measured] | same answer on every test, so the same search [verified] |
 | Split lookahead cache (width ≥ 12) | **shared by all threads**, 2^22 entries per half by default (1152 MB total), with prefetching: about 1.35× faster than the shared 2^20 cache and about 1.6× faster than the original per-thread cache at width 12 (sections 3.10, 3.12) [measured, M4 Pro] | same answers [verified] |
+| Lookahead membership tests (widths 4–9, per-pair tables) | the innermost row33 test reads the small factored half-masks instead of a per-pair table opened only for that test: c/5 w9 odd 1.13× faster (1 and 4 threads), c/3 w9 1.04–1.06×, widths 7–8 1.02–1.04× (section 3.13) [measured, M4 Pro] | identical output [verified] |
 | Bugs | 22 fixed; 19 also exist in the original (section 6) | no change on valid input [verified] |
 | Readability | cryptic names renamed, an explanatory overview and comments added, dead code removed (section 7) | no change [verified] |
 | New features | progress readouts with time and memory; `--lookahead-depth`; `--tables`; `--lookahead-method` / `--lookahead-budget`; `--help` performance notes | — |
@@ -315,6 +316,30 @@ Two other build options were measured (single thread, 3 interleaved runs each) [
 With a 1 GB cache almost every lookup misses the CPU caches, and `lookAheadSplit()` did its lookups one after another, each waiting for memory. It now first computes the address of every entry the test may read (one per half of row11, for each allowed overlap value) and asks the CPU to start loading them (`splitPrefetch()`, two cache lines per 144-byte entry), then does the test as before. The memory accesses overlap.
 
 Measured (single thread, c/5 w12 even, time to the 4th deepening, two rounds): 59.7 / 59.5 s without, 49.8 / 51.6 s with prefetching, about 1.15–1.2× faster [measured]. Prefetching only changes timing, so the answers are unchanged (same checks as 3.10, rerun with this change: 0 `-DLA_VERIFY` mismatches with 4 threads and `--split-cache-bits 10`; the regression searches identical to the original, standard and with `--lookahead-method split`, clang and gcc) [verified].
+
+### 3.13 Membership tests from the half-masks (`useFactoredInner`, widths 4–9)
+
+The idea came from someone else's edit of this program (shared by the user on 20 October 2026), which reported about 14% at c/5 w9.
+
+**What it does.** In the full lookahead, the innermost test asks, for each row23, whether any row22 is a row reachable from the pair (row13, row23). With per-pair tables that meant opening table (row13, row23), a fresh pair almost every time, just to read its mask. The tables form a pool of hundreds of MB, so that read was usually a cache miss. The factored half-masks (section 4.4) hold exactly the same set (the low and high halves of a row are independent apart from their two overlap bits), take a few hundred kB and stay in cache. Per-pair searches now also build the half-tables and answer that test from them (`factoredBases()` + `factoredHasRowBase()`, the index bases computed once per pair). The candidate lists still come from the per-pair tables, so the search visits rows in the same order.
+
+Applied in both places with that loop: `lookAheadFastT()` (the `half` argument; `lookAheadFastPairHalf()`) and `lookAheadReference()` (used for every c/3 lookahead and with the lookahead cache). Also from the same edit: the masks of the row12 tables are prefetched before the loop that reads them, the two lookahead stage builders are inlined with the table representation as a constant, and `lookaheadDepth` is read once per call.
+
+**Where it does not help.** The other membership tests in the lookahead (stage 0's row11 test, the row23 test, skipping empty row22 lists) were tried the same way and were 0–3.5% slower: each of those tables is read right afterwards for a list, so the cache miss happens anyway and the extra test only adds work [measured].
+
+Measured (single thread unless stated, two runs at a time on an M4 Pro, best of two):
+
+| Search | before | after | |
+|---|---|---|---|
+| c/5 w9 odd | 36.1 s | 31.9 s | 1.13× |
+| c/5 w9 odd, `-t 4` | 9.8 s | 8.7 s | 1.13× |
+| c/3 w9 even / odd | 4.37 / 38.2 s | 4.12 / 36.6 s | 1.06× / 1.04× |
+| c/4 w8 even, 2c/5 w8 odd, c/6 w7 even | | | 1.02–1.04× |
+| c/4 w10 even (factored tables), c/5 w8 with `-c 20` | | | about 1.00× |
+
+The gain grows with width (the per-pair pool grows) and with other programs competing for the CPU caches: with five searches running at once, c/5 w9 odd was 1.20× faster.
+
+Verified: `tools/regress.sh` all OK against the original 2.4b (default, `-DPACKLISTS`, `-DLA_VERIFY`, `-DFACTORED_SORTED` builds, gcc); identical output to the previous version on the 8 searches above and on c/5 w9 odd with `-t 4 --disable-early-exit` [verified].
 
 ---
 
